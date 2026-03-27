@@ -1,0 +1,49 @@
+# Core framework
+fastapi
+uvicorn[standard]
+
+# Zerodha Kite Connect
+kiteconnect
+
+# jugaad-trader — Console API auto-login (no manual token needed)
+jugaad-trader
+
+# Environment variable management
+python-dotenv
+
+# HTTP client for async requests
+httpx
+
+# Data handling
+pandas
+pydantic
+
+# AI — Anthropic fallback
+anthropic
+
+# Google Gemini (Gemini fallback path)
+google-generativeai
+
+# Groq (primary TradingAgents LLM provider — OpenAI-compatible, free)
+groq
+
+# TradingAgents dependencies (from backend/analysis/tradingagents/pyproject.toml)
+# Install the package itself with: pip install -e backend/analysis/tradingagents
+langchain-core>=0.3.81
+langchain-anthropic>=0.3.15
+langchain-openai>=0.3.23
+langchain-google-genai>=2.1.5
+langchain-experimental>=0.3.4
+langgraph>=0.4.8
+yfinance>=0.2.63
+stockstats>=0.6.5
+backtrader>=1.9.78.123
+rich>=14.0.0
+typer>=0.21.0
+questionary>=2.1.0
+rank-bm25>=0.2.2
+redis>=6.2.0
+requests>=2.32.4
+tqdm>=4.67.1
+parsel>=1.10.0
+pytz>=2025.2

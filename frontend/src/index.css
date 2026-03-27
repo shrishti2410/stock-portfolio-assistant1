@@ -1,0 +1,16 @@
+/* Tailwind v4 — single import replaces @tailwind base/components/utilities */
+@import "tailwindcss";
+
+/* Full-height dark background */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #0f172a;
+  min-height: 100vh;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
