@@ -46,7 +46,10 @@ def _dummy_holdings() -> list[dict]:
 
 def _get_holdings_via_console() -> list[dict] | None:
     """
-    Fetch real holdings via jugaad-trader using login_using_enc_token.
+    Fetch real holdings via jugaad-trader.
+
+    Supports both jugaad-trader v0.20+ (login()) and older versions
+    (login_using_enc_token()).
 
     Returns:
         list[dict]  — real holdings (may be empty if account has none)
@@ -55,6 +58,7 @@ def _get_holdings_via_console() -> list[dict] | None:
         Exception   — credentials set but login/fetch failed
     """
     from jugaad_trader import Zerodha
+    import pyotp
 
     user_id     = os.getenv("ZERODHA_USER_ID",     "").strip()
     password    = os.getenv("ZERODHA_PASSWORD",    "").strip()
@@ -65,8 +69,22 @@ def _get_holdings_via_console() -> list[dict] | None:
         return None
 
     print(f"[client] Console API: logging in as {user_id}…")
-    kite          = Zerodha(user_id=user_id, password=password, twofa=totp_secret)
-    kite.login_using_enc_token()
+
+    # Generate current TOTP code from secret
+    totp = pyotp.TOTP(totp_secret)
+    totp_code = totp.now()
+
+    # jugaad-trader v0.20+ uses login() method
+    kite = Zerodha(user_id=user_id, password=password, twofa=totp_code)
+
+    if hasattr(kite, 'login'):
+        kite.login()
+    elif hasattr(kite, 'login_using_enc_token'):
+        kite.login_using_enc_token()
+    else:
+        # Try step-by-step login
+        kite.login_step1()
+        kite.login_step2(totp_code)
 
     raw      = kite.holdings()
     holdings = []

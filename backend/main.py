@@ -3,16 +3,28 @@ main.py — FastAPI entry point for Stock Portfolio Assistant
 
 Endpoints
 ---------
-GET /health                            → liveness check
-GET /api/portfolio                     → raw holdings from Zerodha (or dummy data)
-GET /api/analysis/{symbol}             → rule-based Buy/Sell/Hold for a single stock
-GET /api/analysis/ai/{symbol}          → TradingAgents + Gemini AI analysis (slow, 120s timeout)
-GET /api/dashboard                     → holdings + rule-based analysis merged per stock
-GET /api/auth/login                    → returns Zerodha login URL
-GET /api/auth/callback?request_token=  → exchanges token, saves to .env
-
-/api/dashboard stays fast (rule-based).
-/api/analysis/ai/{symbol} is the slow AI path — called on explicit user request only.
+GET  /health                            → liveness check
+GET  /api/portfolio                     → raw holdings from Zerodha (or dummy data)
+GET  /api/dashboard                     → holdings + rule-based analysis merged per stock
+GET  /api/screen/{symbol}               → fast technical screening (RSI, MACD, EMA — no LLM)
+GET  /api/analysis/{symbol}             → rule-based Buy/Sell/Hold for a single stock
+GET  /api/analysis/ai/{symbol}          → multi-agent AI analysis (slow, 600s timeout)
+GET  /api/analyze/{symbol}              → full analysis for any stock (screening + AI)
+GET  /api/search/stocks?q=              → autocomplete symbol search
+DEL  /api/analysis/cache                → clear AI cache
+GET  /api/auth/login                    → returns Zerodha login URL
+GET  /api/auth/callback?request_token=  → exchanges token, saves to .env
+GET  /api/auth/status                   → check if Zerodha connected
+DEL  /api/auth/logout                   → clears Zerodha token
+POST /api/strategies                    → create strategy from natural language
+GET  /api/strategies                    → list all strategies
+GET  /api/strategies/{id}               → strategy detail with rules
+PUT  /api/strategies/{id}               → update strategy
+DEL  /api/strategies/{id}               → delete strategy
+POST /api/strategies/{id}/watchlist     → add symbols to watchlist
+POST /api/strategies/{id}/run           → execute strategy against watchlist
+GET  /api/alerts                        → list alerts
+PUT  /api/alerts/{id}/read              → mark alert as read
 """
 
 import asyncio
@@ -210,6 +222,23 @@ async def get_analysis_ai(symbol: str):
             status_code=504,
             detail=f"Analysis for {symbol} timed out after 600 seconds. Try again.",
         )
+
+    # Save to analysis history DB
+    try:
+        from db.database import save_analysis
+        import json
+        # Also capture screening data for historical context
+        screening_json = None
+        try:
+            from analysis.screener import screen_stock
+            sr = await asyncio.to_thread(screen_stock, symbol)
+            screening_json = json.dumps(sr.to_dict())
+        except Exception:
+            pass
+        await save_analysis(symbol, result, screening_json)
+    except Exception as exc:
+        print(f"[main] Failed to save analysis history: {exc}")
+
     return {"symbol": symbol, **result}
 
 
@@ -282,6 +311,93 @@ async def get_dashboard():
 
     dashboard = await asyncio.gather(*[_merge(h) for h in holdings])
     return list(dashboard)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Technical screening (fast, no LLM)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/screen/{symbol}")
+async def screen_stock_endpoint(symbol: str):
+    """
+    Run technical screening on a single stock.
+    Returns signals (RSI, MACD, EMA crossovers, etc.), indicators, and overall direction.
+    Fast (1-3 seconds) — no LLM calls, pure pandas_ta computation.
+    """
+    from analysis.screener import screen_stock
+
+    symbol = symbol.upper().strip()
+    try:
+        result = await asyncio.to_thread(screen_stock, symbol)
+        return result.to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Screening failed for {symbol}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: External stock analysis (any NSE stock)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/search/stocks")
+async def search_stocks(q: str = Query(..., min_length=1)):
+    """
+    Search NSE stock symbols. Returns matching symbols + company names
+    for autocomplete. Uses a local symbol list from NSE.
+    """
+    from data.nse_symbols import search_symbols
+
+    try:
+        results = await asyncio.to_thread(search_symbols, q)
+        return results
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Symbol search failed: {exc}")
+
+
+@app.get("/api/analyze/{symbol}")
+async def analyze_external_stock(symbol: str):
+    """
+    Full analysis of any NSE stock (not necessarily in portfolio).
+    Combines technical screening + AI analysis.
+    Returns: screening signals + AI recommendation + price summary.
+    """
+    from analysis.screener import screen_stock
+
+    symbol = symbol.upper().strip()
+
+    # Run screening (fast)
+    try:
+        screening = await asyncio.to_thread(screen_stock, symbol)
+        screening_data = screening.to_dict()
+    except Exception as exc:
+        screening_data = {"error": str(exc)}
+
+    # Run AI analysis (slow)
+    try:
+        ai_result = await asyncio.wait_for(analyze_stock_ai(symbol, 0.0), timeout=600.0)
+    except asyncio.TimeoutError:
+        ai_result = {
+            "recommendation": "Hold",
+            "reasoning": f"AI analysis timed out for {symbol}",
+            "trend": "Neutral",
+            "confidence": 0.3,
+            "source": "timeout",
+        }
+    except Exception as exc:
+        ai_result = {
+            "recommendation": "Hold",
+            "reasoning": f"AI analysis failed: {exc}",
+            "trend": "Neutral",
+            "confidence": 0.3,
+            "source": "error",
+        }
+
+    return {
+        "symbol": symbol,
+        "screening": screening_data,
+        "ai_analysis": ai_result,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +480,257 @@ async def auth_logout():
     _write_env_key("ZERODHA_ACCESS_TOKEN", "")
     os.environ["ZERODHA_ACCESS_TOKEN"] = ""
     return {"status": "logged out"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Strategy builder + alerts
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup():
+    from db.database import init_db
+    await init_db()
+
+
+@app.post("/api/strategies")
+async def create_strategy_endpoint(body: dict):
+    """Parse natural language input into rules and store as a strategy."""
+    from analysis.rule_parser import parse_strategy
+    from db.database import create_strategy, add_rules, add_to_watchlist
+
+    user_input = body.get("input", "").strip()
+    if not user_input:
+        raise HTTPException(status_code=400, detail="'input' field is required")
+
+    # Parse with LLM
+    parsed = await parse_strategy(user_input)
+
+    # Create strategy
+    strategy_id = await create_strategy(
+        name=parsed["name"],
+        description=parsed["description"],
+        raw_input=user_input,
+    )
+
+    # Add rules
+    if parsed["rules"]:
+        await add_rules(strategy_id, parsed["rules"])
+
+    # Add watchlist symbols (from request + LLM suggestions)
+    symbols = body.get("symbols", []) + parsed.get("suggested_symbols", [])
+    if symbols:
+        await add_to_watchlist(strategy_id, symbols)
+
+    return {"id": strategy_id, **parsed}
+
+
+@app.get("/api/strategies")
+async def list_strategies():
+    """List all strategies with rule counts and active status."""
+    from db.database import get_strategies
+    return await get_strategies()
+
+
+@app.get("/api/strategies/{strategy_id}")
+async def get_strategy_endpoint(strategy_id: int):
+    """Get strategy details with rules and watchlist."""
+    from db.database import get_strategy
+    result = await get_strategy(strategy_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return result
+
+
+@app.put("/api/strategies/{strategy_id}")
+async def update_strategy_endpoint(strategy_id: int, body: dict):
+    """Update strategy name, active status, etc."""
+    from db.database import update_strategy
+    found = await update_strategy(strategy_id, **body)
+    if not found:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return {"status": "updated"}
+
+
+@app.delete("/api/strategies/{strategy_id}")
+async def delete_strategy_endpoint(strategy_id: int):
+    """Delete a strategy and its rules."""
+    from db.database import delete_strategy
+    found = await delete_strategy(strategy_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/strategies/{strategy_id}/watchlist")
+async def add_to_watchlist_endpoint(strategy_id: int, body: dict):
+    """Add symbols to a strategy's watchlist."""
+    from db.database import add_to_watchlist
+    symbols = body.get("symbols", [])
+    if not symbols:
+        raise HTTPException(status_code=400, detail="'symbols' list is required")
+    await add_to_watchlist(strategy_id, symbols)
+    return {"status": "added", "count": len(symbols)}
+
+
+@app.post("/api/strategies/{strategy_id}/run")
+async def run_strategy_endpoint(strategy_id: int):
+    """Execute strategy against watchlist. Returns triggered alerts."""
+    from db.database import run_strategy
+    alerts = await run_strategy(strategy_id)
+    return alerts
+
+
+@app.get("/api/alerts")
+async def get_alerts_endpoint(
+    strategy_id: int = Query(None),
+    unread: bool = Query(True),
+):
+    """Get alerts, optionally filtered."""
+    from db.database import get_alerts
+    return await get_alerts(strategy_id=strategy_id, unread_only=unread)
+
+
+@app.put("/api/alerts/{alert_id}/read")
+async def mark_alert_read_endpoint(alert_id: int):
+    """Mark an alert as read."""
+    from db.database import mark_alert_read
+    found = await mark_alert_read(alert_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"status": "read"}
+
+
+# ---------------------------------------------------------------------------
+# Analysis History
+# ---------------------------------------------------------------------------
+
+@app.get("/api/history")
+async def get_history(symbol: str = Query(None), limit: int = Query(50)):
+    """Get analysis history. Optionally filter by symbol."""
+    from db.database import get_analysis_history
+    return await get_analysis_history(symbol=symbol, limit=limit)
+
+
+@app.get("/api/history/{symbol}/latest")
+async def get_latest_analysis_endpoint(symbol: str):
+    """Get the most recent saved analysis for a stock."""
+    from db.database import get_latest_analysis
+    result = await get_latest_analysis(symbol.upper())
+    if not result:
+        raise HTTPException(status_code=404, detail="No analysis history found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# NSE Option Chain
+# ---------------------------------------------------------------------------
+
+@app.get("/api/options/symbols")
+async def get_option_symbols():
+    """List symbols with active NSE options."""
+    from data.options import get_option_symbols
+    return get_option_symbols()
+
+
+@app.get("/api/options/{symbol}")
+async def get_option_chain_endpoint(symbol: str):
+    """Fetch full NSE option chain for a stock or index."""
+    from data.options import get_option_chain
+    symbol = symbol.upper().strip()
+    try:
+        result = await asyncio.to_thread(get_option_chain, symbol)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Option chain failed for {symbol}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# MCX Commodities
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mcx")
+async def get_mcx_prices():
+    """Fetch current prices for major MCX commodities."""
+    from data.mcx import get_commodity_prices
+    try:
+        return await asyncio.to_thread(get_commodity_prices)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MCX fetch failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Predefined F&O Strategies
+# ---------------------------------------------------------------------------
+
+@app.get("/api/predefined-strategies")
+async def get_predefined_strategies():
+    """List all 13 predefined F&O trading strategies."""
+    from data.predefined_strategies import get_all_strategies
+    return get_all_strategies()
+
+
+@app.get("/api/predefined-strategies/categories")
+async def get_strategy_categories():
+    """Get strategy category metadata."""
+    from data.predefined_strategies import get_categories
+    return get_categories()
+
+
+@app.get("/api/predefined-strategies/{strategy_id}")
+async def get_predefined_strategy(strategy_id: str):
+    """Get a single predefined strategy by ID."""
+    from data.predefined_strategies import get_strategy
+    result = get_strategy(strategy_id)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+    return result
+
+
+@app.get("/api/predefined-strategies/{strategy_id}/check/{symbol}")
+async def check_predefined_strategy(strategy_id: str, symbol: str = "NIFTY"):
+    """Check if a strategy's entry conditions are met for a given symbol."""
+    from data.predefined_strategies import check_strategy_conditions
+
+    symbol = symbol.upper().strip()
+
+    # Get option chain data
+    option_data = {}
+    try:
+        from data.options import get_option_chain
+        option_data = await asyncio.to_thread(get_option_chain, symbol)
+    except Exception:
+        option_data = {"spot_price": 0, "pcr": 0, "strikes": [], "market_closed": True}
+
+    # Get technical indicators
+    indicators = {}
+    try:
+        from analysis.screener import screen_stock
+        result = await asyncio.to_thread(screen_stock, symbol)
+        indicators = result.indicators
+    except Exception:
+        pass
+
+    return check_strategy_conditions(strategy_id, option_data, indicators)
+
+
+@app.get("/api/mcx/list")
+async def get_mcx_list():
+    """List all available MCX commodities."""
+    from data.mcx import get_commodity_list
+    return get_commodity_list()
+
+
+@app.get("/api/mcx/{symbol}")
+async def get_mcx_history(symbol: str, days: int = Query(90)):
+    """Fetch OHLCV history for a single MCX commodity."""
+    from data.mcx import get_commodity_history
+    try:
+        result = await asyncio.to_thread(get_commodity_history, symbol.upper(), days)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MCX history failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

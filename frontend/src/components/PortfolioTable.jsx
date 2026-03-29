@@ -5,6 +5,8 @@
  *   data     Array of dashboard rows
  *   loading  Boolean — show skeleton rows while true
  */
+import { Link } from 'react-router-dom'
+
 export default function PortfolioTable({ data, loading }) {
   const fmt = (n) =>
     new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(n)
@@ -63,11 +65,14 @@ export default function PortfolioTable({ data, loading }) {
                   key={row.symbol}
                   className={`border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors ${rowBg}`}
                 >
-                  {/* Stock */}
+                  {/* Stock (clickable → analysis page) */}
                   <td className="px-4 py-3 text-left">
-                    <span className="font-semibold text-white tracking-wide">
+                    <Link
+                      to={`/stock/${row.symbol}`}
+                      className="font-semibold text-white tracking-wide hover:text-emerald-300 transition-colors"
+                    >
                       {row.symbol}
-                    </span>
+                    </Link>
                   </td>
 
                   {/* Qty */}
