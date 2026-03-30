@@ -1,16 +1,20 @@
 """
-analyzer.py — Multi-agent AI analysis using Groq + yfinance
+analyzer.py — Multi-agent AI analysis using Groq + jugaad-data/pandas_ta
 
 Public API:
     analyze_stock_ai(symbol, pnl_pct) → called by /api/analysis/ai/{symbol}
 
 Pipeline (blocking, runs in asyncio.to_thread):
-    Agent 1 — Technical  : last 10 days closing prices → Groq prompt (~100 tokens out)
-    Agent 2 — Fundamental: PE, 52W high/low, P&L      → Groq prompt (~100 tokens out)
-    Agent 3 — Synthesis  : combines both → DECISION/REASON format (~150 tokens out)
+    Agent 1 — Technical  : RSI, MACD, EMA, Bollinger, ADX from screener → Groq prompt
+    Agent 2 — Fundamental: PE, 52W high/low, P&L (yfinance fallback)   → Groq prompt
+    Agent 3 — Synthesis  : combines both → DECISION/REASON format      → Groq prompt
+
+Data sources:
+    - Price data: jugaad-data (direct NSE) via screener.py, yfinance fallback
+    - Fundamentals: yfinance (jugaad-data doesn't have PE, market cap etc.)
+    - Technical indicators: pandas_ta via screener.py
 
 Model: llama-3.3-70b-versatile via Groq (free tier, 128k context)
-Each agent call sends <500 tokens total — well within free limits.
 
 Fallback: Gemini three-agent analysis on data/symbol errors.
 Cache: per-symbol, 1 hour TTL (only successful results are cached).
@@ -67,37 +71,29 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 def run_multi_agent_analysis(symbol: str, holding_data: dict) -> dict:
     """
-    Three focused Groq calls — each under 500 tokens total.
+    Three focused Groq calls enriched with PKScreener-style technical indicators.
 
-    Agent 1 — Technical  : last 10 days prices
-    Agent 2 — Fundamental: PE, 52W range, current P&L
+    Agent 1 — Technical  : RSI, MACD, EMA crossovers, Bollinger, ADX, volume
+    Agent 2 — Fundamental: PE, 52W range, sector, current P&L
     Agent 3 — Synthesis  : final DECISION + REASON
     """
-    import yfinance as yf
     from groq import Groq
+    from analysis.screener import get_price_summary_for_prompt, get_fundamental_data
 
     load_dotenv(override=True)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise ValueError("GROQ_API_KEY is not set in .env. Get a free key at https://console.groq.com")
 
-    client     = Groq(api_key=api_key)
-    nse_symbol = get_nse_symbol(symbol)
-    print(f"[MultiAgent] Using symbol: {nse_symbol}")
+    client = Groq(api_key=api_key)
+    print(f"[MultiAgent] Analyzing {symbol} with screener data…")
 
-    ticker = yf.Ticker(nse_symbol)
-    hist   = ticker.history(period="1mo")
-    info   = ticker.info
+    # Fetch technical data from screener (jugaad-data + pandas_ta)
+    tech_summary = get_price_summary_for_prompt(symbol)
 
-    prices  = hist["Close"].tail(10).round(2).to_dict()
+    # Fetch fundamental data (yfinance fallback)
+    fund_data = get_fundamental_data(symbol)
     pnl_pct = holding_data.get("pnl_percentage", 0)
-    metrics = {
-        "pe_ratio":      info.get("trailingPE",       "N/A"),
-        "52w_high":      info.get("fiftyTwoWeekHigh", "N/A"),
-        "52w_low":       info.get("fiftyTwoWeekLow",  "N/A"),
-        "current_price": info.get("currentPrice",     "N/A"),
-        "pnl_pct":       pnl_pct,
-    }
 
     # ── Agent 1: Technical ───────────────────────────────────────────────────
     print(f"[MultiAgent] Agent 1 (Technical) for {symbol}…")
@@ -106,12 +102,14 @@ def run_multi_agent_analysis(symbol: str, holding_data: dict) -> dict:
         messages=[{
             "role": "user",
             "content": (
-                f"You are a technical analyst. Analyze {symbol} stock. "
-                f"Last 10 days closing prices: {prices}. "
-                "Give Buy/Sell/Hold with one sentence reason."
+                f"You are a technical analyst specializing in Indian NSE stocks. "
+                f"Analyze {symbol} based on these technical indicators:\n\n"
+                f"{tech_summary}\n\n"
+                "Based on these indicators, give a Buy/Sell/Hold recommendation "
+                "with 3-4 sentences explaining your reasoning."
             ),
         }],
-        max_tokens=100,
+        max_tokens=300,
     )
     tech_result = tech_resp.choices[0].message.content
     print(f"[MultiAgent] Technical: {tech_result[:80]}…")
@@ -123,15 +121,19 @@ def run_multi_agent_analysis(symbol: str, holding_data: dict) -> dict:
         messages=[{
             "role": "user",
             "content": (
-                f"You are a fundamental analyst. {symbol} metrics: "
-                f"PE={metrics['pe_ratio']}, "
-                f"52W High={metrics['52w_high']}, "
-                f"52W Low={metrics['52w_low']}, "
-                f"Current P&L={metrics['pnl_pct']}%. "
-                "Give Buy/Sell/Hold with one sentence reason."
+                f"You are a fundamental analyst. {symbol} (NSE India) metrics:\n"
+                f"PE Ratio: {fund_data['pe_ratio']}\n"
+                f"Market Cap: {fund_data['market_cap_display']}\n"
+                f"52W High: {fund_data['52w_high']}\n"
+                f"52W Low: {fund_data['52w_low']}\n"
+                f"Sector: {fund_data['sector']}\n"
+                f"Book Value: {fund_data['book_value']}\n"
+                f"Dividend Yield: {fund_data['dividend_yield']}\n"
+                f"Current Unrealised P&L: {pnl_pct:+.1f}%\n\n"
+                "Is it overvalued or undervalued? Give Buy/Sell/Hold with 3-4 sentences."
             ),
         }],
-        max_tokens=100,
+        max_tokens=300,
     )
     fund_result = fund_resp.choices[0].message.content
     print(f"[MultiAgent] Fundamental: {fund_result[:80]}…")
@@ -143,15 +145,16 @@ def run_multi_agent_analysis(symbol: str, holding_data: dict) -> dict:
         messages=[{
             "role": "user",
             "content": (
-                f"You are a portfolio manager. For {symbol} stock:\n"
-                f"Technical says: {tech_result}\n"
-                f"Fundamental says: {fund_result}\n"
-                "Reply with exactly:\n"
+                f"You are a senior portfolio manager reviewing {symbol} stock (NSE India).\n\n"
+                f"Technical analysis says: {tech_result}\n\n"
+                f"Fundamental analysis says: {fund_result}\n\n"
+                "Give ONE final recommendation. Reply with exactly:\n"
                 "DECISION: [Buy/Sell/Hold]\n"
-                "REASON: [one sentence]"
+                "REASON: [4-5 sentences combining both technical and fundamental perspectives. "
+                "Be specific about the indicators and metrics that led to your decision.]"
             ),
         }],
-        max_tokens=150,
+        max_tokens=500,
     )
     final_result = final_resp.choices[0].message.content
     print(f"[MultiAgent] Synthesis raw: {final_result}")
@@ -166,8 +169,6 @@ def run_multi_agent_analysis(symbol: str, holding_data: dict) -> dict:
         recommendation = "Hold"
 
     reasoning = final_result.replace("DECISION:", "").replace("REASON:", "").strip()
-    if len(reasoning) > 200:
-        reasoning = reasoning[:200].rsplit(" ", 1)[0] + "…"
 
     print(f"[MultiAgent] {symbol} → {recommendation}")
 
@@ -210,29 +211,57 @@ def _call_gemini(prompt: str) -> str:
 
 
 def _fetch_price_data(symbol: str) -> str:
-    import yfinance as yf
-    hist = yf.Ticker(f"{symbol}.NS").history(period="30d")
-    if hist.empty:
-        return f"No price data found for {symbol}.NS"
-    lines = [f"{d.strftime('%Y-%m-%d')}: ₹{c:.2f}"
-             for d, c in hist["Close"].items()]
-    return "\n".join(lines)
+    """Fetch price data using screener (jugaad-data), fallback to yfinance."""
+    try:
+        from analysis.screener import get_price_summary_for_prompt
+        return get_price_summary_for_prompt(symbol)
+    except Exception:
+        pass
+
+    # Fallback to yfinance
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(f"{symbol}.NS").history(period="30d")
+        if hist.empty:
+            return f"No price data found for {symbol}.NS"
+        lines = [f"{d.strftime('%Y-%m-%d')}: ₹{c:.2f}"
+                 for d, c in hist["Close"].items()]
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Price data unavailable for {symbol}: {exc}"
 
 
 def _fetch_fundamental_metrics(symbol: str) -> str:
-    import yfinance as yf
-    info      = yf.Ticker(f"{symbol}.NS").info
-    pe        = info.get("trailingPE",       "N/A")
-    mktcap    = info.get("marketCap",        "N/A")
-    week_high = info.get("fiftyTwoWeekHigh", "N/A")
-    week_low  = info.get("fiftyTwoWeekLow",  "N/A")
-    sector    = info.get("sector",           "N/A")
-    if isinstance(mktcap, (int, float)):
-        mktcap = f"₹{mktcap / 1e7:.1f} Cr"
-    return (
-        f"Sector: {sector} | PE Ratio: {pe} | Market Cap: {mktcap} | "
-        f"52W High: ₹{week_high} | 52W Low: ₹{week_low}"
-    )
+    """Fetch fundamental metrics using screener, fallback to yfinance."""
+    try:
+        from analysis.screener import get_fundamental_data
+        data = get_fundamental_data(symbol)
+        return (
+            f"Sector: {data['sector']} | PE Ratio: {data['pe_ratio']} | "
+            f"Market Cap: {data['market_cap_display']} | "
+            f"52W High: ₹{data['52w_high']} | 52W Low: ₹{data['52w_low']} | "
+            f"Book Value: {data['book_value']} | Dividend Yield: {data['dividend_yield']}"
+        )
+    except Exception:
+        pass
+
+    # Fallback to direct yfinance
+    try:
+        import yfinance as yf
+        info      = yf.Ticker(f"{symbol}.NS").info
+        pe        = info.get("trailingPE",       "N/A")
+        mktcap    = info.get("marketCap",        "N/A")
+        week_high = info.get("fiftyTwoWeekHigh", "N/A")
+        week_low  = info.get("fiftyTwoWeekLow",  "N/A")
+        sector    = info.get("sector",           "N/A")
+        if isinstance(mktcap, (int, float)):
+            mktcap = f"₹{mktcap / 1e7:.1f} Cr"
+        return (
+            f"Sector: {sector} | PE Ratio: {pe} | Market Cap: {mktcap} | "
+            f"52W High: ₹{week_high} | 52W Low: ₹{week_low}"
+        )
+    except Exception as exc:
+        return f"Fundamental data unavailable for {symbol}: {exc}"
 
 
 def _parse_synthesis(text: str) -> tuple[str, str]:
@@ -241,10 +270,8 @@ def _parse_synthesis(text: str) -> tuple[str, str]:
     recommendation = rec_match.group(1).capitalize() if rec_match else "Hold"
     if rea_match:
         reasoning = rea_match.group(1).strip()
-        if len(reasoning) > 150:
-            reasoning = reasoning[:150].rsplit(" ", 1)[0] + "…"
     else:
-        reasoning = text.strip()[:150]
+        reasoning = text.strip()
     return recommendation, reasoning
 
 

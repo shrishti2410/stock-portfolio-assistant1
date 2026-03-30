@@ -38,7 +38,7 @@ const SOURCE_LABEL = {
   rule_based:           'Rule-based',
 }
 
-export default function RecommendationCard({ item, externalAiResult = null, onAiResult }) {
+export default function RecommendationCard({ item, externalAiResult = null, screeningData = null, onAiResult }) {
   const [aiResult,  setAiResult]  = useState(null)
   const [aiLoading, setAiLoading] = useState(false)
   const [aiError,   setAiError]   = useState('')
@@ -50,6 +50,7 @@ export default function RecommendationCard({ item, externalAiResult = null, onAi
 
   const display = aiResult ?? item
   const isAI    = aiResult !== null
+  const hasScreening = screeningData !== null
 
   const badge         = BADGE[display.recommendation] ?? BADGE.Hold
   const trend         = TREND[display.trend]          ?? TREND.Neutral
@@ -106,10 +107,33 @@ export default function RecommendationCard({ item, externalAiResult = null, onAi
         </span>
       </div>
 
-      {/* Reasoning — full text for AI results, clamped for rule-based */}
+      {/* Reasoning — full text, no truncation */}
       <p className={`text-xs text-slate-400 leading-relaxed ${isAI ? '' : 'line-clamp-3'}`}>
         {display.reasoning}
       </p>
+
+      {/* Screening signal pills */}
+      {hasScreening && screeningData.signals && (
+        <div className="flex flex-wrap gap-1">
+          {screeningData.signals.slice(0, 4).map((sig, i) => {
+            const c = sig.direction === 'bullish'
+              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+              : sig.direction === 'bearish'
+                ? 'bg-red-500/15 text-red-400 border-red-500/30'
+                : 'bg-slate-500/15 text-slate-400 border-slate-500/30'
+            return (
+              <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${c}`}>
+                {sig.name.replace(/_/g, ' ')}
+              </span>
+            )
+          })}
+          {screeningData.signals.length > 4 && (
+            <span className="text-[10px] px-1.5 py-0.5 text-slate-500">
+              +{screeningData.signals.length - 4} more
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Error message */}
       {aiError && (

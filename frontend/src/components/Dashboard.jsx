@@ -31,9 +31,12 @@ export default function Dashboard() {
 
   // Per-symbol AI results injected by "Run All" → fed into each card
   const [aiResults,    setAiResults]    = useState({})   // { symbol: result }
+  // Per-symbol screening results (fast)
+  const [screenResults, setScreenResults] = useState({}) // { symbol: screeningData }
   // Run All progress: null when idle, object while running
   const [runAllStatus, setRunAllStatus] = useState(null) // { label, done, total }
   const [runAllActive, setRunAllActive] = useState(false)
+  const [screenAllActive, setScreenAllActive] = useState(false)
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true)
@@ -84,6 +87,27 @@ export default function Dashboard() {
     setTimeout(() => setRunAllStatus(null), 3000)
   }
 
+  // Screen all stocks (fast — no LLM calls)
+  async function screenAll() {
+    if (screenAllActive || data.length === 0) return
+    setScreenAllActive(true)
+
+    const promises = data.map(async (item) => {
+      try {
+        const res = await fetch(`${API_BASE}/api/screen/${item.symbol}`)
+        if (res.ok) {
+          const result = await res.json()
+          setScreenResults(prev => ({ ...prev, [item.symbol]: result }))
+        }
+      } catch {
+        // Individual failure — continue
+      }
+    })
+
+    await Promise.all(promises)
+    setScreenAllActive(false)
+  }
+
   // ── Error state ──────────────────────────────────────────────────────────
   if (error) {
     return (
@@ -104,82 +128,92 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="min-h-screen bg-[#0f172a] text-slate-100 font-sans">
-      {/* ── Page header ────────────────────────────────────────────────── */}
-      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-bold text-white tracking-tight">
-              Stock Portfolio Assistant
-            </h1>
-            {lastFetched && !loading && (
-              <p className="text-xs text-slate-500 mt-0.5">
-                Last updated {lastFetched.toLocaleTimeString()}
-              </p>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2">
-            {/* Connect Zerodha toggle */}
-            <button
-              onClick={() => setShowConnect((v) => !v)}
-              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium
-                          border transition-colors
-                          ${isConnected
-                            ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-600/30'
-                            : showConnect
-                              ? 'bg-blue-600/20 border-blue-500/50 text-blue-300'
-                              : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
-                          }`}
-            >
-              <span>{isConnected ? '✓' : '⚡'}</span>
-              {isConnected
-                ? (showConnect ? 'Hide' : 'Zerodha Connected')
-                : (showConnect ? 'Hide' : 'Connect Zerodha')
-              }
-            </button>
-
-            {/* Run All AI Analysis */}
-            <button
-              onClick={runAll}
-              disabled={runAllActive || data.length === 0}
-              className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600/20 hover:bg-emerald-600/30
-                         disabled:opacity-50 disabled:cursor-not-allowed
-                         border border-emerald-500/40 rounded-lg text-sm font-medium
-                         text-emerald-300 transition-colors"
-            >
-              {runAllActive ? (
-                <>
-                  <span className="animate-spin inline-block">↻</span>
-                  {runAllStatus?.label ?? 'Running…'}
-                  <span className="text-emerald-500">
-                    ({runAllStatus?.done ?? 0}/{runAllStatus?.total ?? data.length})
-                  </span>
-                </>
-              ) : runAllStatus?.label === 'Done' ? (
-                <>✓ All Done</>
-              ) : (
-                <>✦ Run All AI</>
-              )}
-            </button>
-
-            {/* Refresh */}
-            <button
-              onClick={fetchDashboard}
-              disabled={loading}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600
-                         disabled:opacity-50 disabled:cursor-not-allowed
-                         border border-slate-600 rounded-lg text-sm font-medium
-                         text-slate-200 transition-colors"
-            >
-              <span className={loading ? 'animate-spin inline-block' : ''} aria-hidden="true">
-                ↻
-              </span>
-              {loading ? 'Refreshing…' : 'Refresh'}
-            </button>
-          </div>
+    <div>
+      {/* ── Action bar ─────────────────────────────────────────────────── */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <h1 className="text-lg font-bold text-white tracking-tight">Portfolio</h1>
+          {lastFetched && !loading && (
+            <span className="text-xs text-slate-500">
+              Updated {lastFetched.toLocaleTimeString()}
+            </span>
+          )}
         </div>
-      </header>
+
+        <div className="flex items-center gap-2">
+          {/* Connect Zerodha toggle */}
+          <button
+            onClick={() => setShowConnect((v) => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
+                        border transition-colors
+                        ${isConnected
+                          ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-600/30'
+                          : showConnect
+                            ? 'bg-blue-600/20 border-blue-500/50 text-blue-300'
+                            : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
+                        }`}
+          >
+            <span>{isConnected ? '✓' : '⚡'}</span>
+            {isConnected
+              ? (showConnect ? 'Hide' : 'Zerodha')
+              : (showConnect ? 'Hide' : 'Connect Zerodha')
+            }
+          </button>
+
+          {/* Screen All (fast) */}
+          <button
+            onClick={screenAll}
+            disabled={screenAllActive || data.length === 0}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       border border-blue-500/40 rounded-lg text-xs font-medium
+                       text-blue-300 transition-colors"
+          >
+            {screenAllActive ? (
+              <><span className="animate-spin inline-block">↻</span> Screening…</>
+            ) : (
+              <>⚡ Screen All</>
+            )}
+          </button>
+
+          {/* Run All AI Analysis */}
+          <button
+            onClick={runAll}
+            disabled={runAllActive || data.length === 0}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       border border-emerald-500/40 rounded-lg text-xs font-medium
+                       text-emerald-300 transition-colors"
+          >
+            {runAllActive ? (
+              <>
+                <span className="animate-spin inline-block">↻</span>
+                {runAllStatus?.label ?? 'Running…'}
+                <span className="text-emerald-500 ml-1">
+                  ({runAllStatus?.done ?? 0}/{runAllStatus?.total ?? data.length})
+                </span>
+              </>
+            ) : runAllStatus?.label === 'Done' ? (
+              <>✓ All Done</>
+            ) : (
+              <>✦ Run All AI</>
+            )}
+          </button>
+
+          {/* Refresh */}
+          <button
+            onClick={fetchDashboard}
+            disabled={loading}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       border border-slate-600 rounded-lg text-xs font-medium
+                       text-slate-200 transition-colors"
+          >
+            <span className={loading ? 'animate-spin inline-block' : ''}>↻</span>
+            {loading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
+      </div>
 
       {/* ── Connect Zerodha panel (toggled) ───────────────────────────── */}
       {showConnect && (
@@ -191,7 +225,7 @@ export default function Dashboard() {
       )}
 
       {/* ── Main content ───────────────────────────────────────────────── */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-4">
 
         {loading && data.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24 gap-4">
@@ -223,6 +257,7 @@ export default function Dashboard() {
                     key={item.symbol}
                     item={item}
                     externalAiResult={aiResults[item.symbol] ?? null}
+                    screeningData={screenResults[item.symbol] ?? null}
                     onAiResult={handleAiResult}
                   />
                 ))}

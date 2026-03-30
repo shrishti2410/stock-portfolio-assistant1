@@ -18,6 +18,22 @@ httpx
 pandas
 pydantic
 
+# NSE market data (replaces yfinance for Indian stock prices)
+jugaad-data
+
+# Technical indicators (same library PKScreener uses)
+pandas_ta
+
+# Database (async SQLite for Phase 3)
+aiosqlite
+
+# NSE Option Chain data
+nsepython
+
+# MCX Commodity data (via TradingView)
+# pip install --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git
+tvDatafeed
+
 # AI — Anthropic fallback
 anthropic
 
