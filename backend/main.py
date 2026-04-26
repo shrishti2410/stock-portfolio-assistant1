@@ -31,7 +31,7 @@ import asyncio
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
@@ -490,6 +490,12 @@ async def auth_logout():
 async def startup():
     from db.database import init_db
     await init_db()
+    # Sync market events to DB
+    try:
+        from trading.events import sync_events_to_db
+        await sync_events_to_db()
+    except Exception as e:
+        print(f"[startup] Event sync: {e}")
 
 
 @app.post("/api/strategies")
@@ -800,3 +806,438 @@ def _html_page(success: bool, message: str = "") -> str:
   </div>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Trading Engine API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/trading/status")
+async def trading_status():
+    """Get trading engine status."""
+    from trading.engine import trading_engine
+    return trading_engine.status
+
+
+@app.post("/api/trading/start")
+async def trading_start():
+    """Start the trading engine. Auto-enables engine_enabled flag."""
+    from trading.engine import trading_engine
+    from db.database import _get_db
+
+    # Auto-enable engine_enabled when user clicks Start
+    async with _get_db() as db:
+        await db.execute(
+            "UPDATE trading_config SET engine_enabled = 1, updated_at = CURRENT_TIMESTAMP WHERE id = 1"
+        )
+        await db.commit()
+
+    config = await trading_engine._load_config()
+
+    # Validate at least one strategy is enabled
+    import json
+    enabled = json.loads(config.get("strategies_enabled", "[]"))
+    if not enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="No strategies enabled. Go to Settings and enable at least one strategy."
+        )
+
+    return await trading_engine.start(config)
+
+
+@app.post("/api/trading/stop")
+async def trading_stop():
+    """Stop the trading engine."""
+    from trading.engine import trading_engine
+    return await trading_engine.stop()
+
+
+@app.post("/api/trading/scan-now")
+async def trading_scan_now():
+    """Trigger an immediate scan (auto-enables engine flag for this scan)."""
+    from trading.engine import trading_engine
+    from db.database import _get_db
+
+    # Auto-enable engine_enabled for manual scan
+    async with _get_db() as db:
+        await db.execute(
+            "UPDATE trading_config SET engine_enabled = 1 WHERE id = 1"
+        )
+        await db.commit()
+
+    config = await trading_engine._load_config()
+
+    # Validate at least one strategy is enabled
+    import json
+    enabled = json.loads(config.get("strategies_enabled", "[]"))
+    if not enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="No strategies enabled. Go to Settings and enable at least one strategy."
+        )
+
+    result = await trading_engine.run_scan(config)
+    # Update P&L after scan
+    try:
+        await trading_engine.update_paper_pnl()
+    except Exception:
+        pass
+    return result
+
+
+@app.get("/api/trading/config")
+async def trading_get_config():
+    """Get trading configuration."""
+    from trading.engine import trading_engine
+    config = await trading_engine._load_config()
+    # Parse JSON fields for frontend
+    import json
+    config["strategies_enabled"] = json.loads(config.get("strategies_enabled", "[]"))
+    return config
+
+
+@app.put("/api/trading/config")
+async def trading_update_config(body: dict):
+    """Update trading configuration."""
+    import json
+    from db.database import _get_db
+
+    # Ensure config row exists
+    async with _get_db() as db:
+        await db.execute("INSERT OR IGNORE INTO trading_config (id) VALUES (1)")
+        await db.commit()
+
+    allowed = {
+        "max_capital", "max_loss_per_trade", "max_daily_loss", "max_positions",
+        "risk_per_trade_pct", "paper_mode", "engine_enabled", "strategies_enabled",
+        "scan_interval_min", "nifty_lot_size", "banknifty_lot_size",
+    }
+    updates = {}
+    for k, v in body.items():
+        if k in allowed:
+            if k == "strategies_enabled" and isinstance(v, list):
+                updates[k] = json.dumps(v)
+            elif k == "paper_mode":
+                updates[k] = 1 if v else 0
+            elif k == "engine_enabled":
+                updates[k] = 1 if v else 0
+            else:
+                updates[k] = v
+
+    if not updates:
+        return {"status": "no changes"}
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values())
+
+    async with _get_db() as db:
+        await db.execute(
+            f"UPDATE trading_config SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            values,
+        )
+        await db.commit()
+
+        # Return updated config
+        import aiosqlite
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall("SELECT * FROM trading_config WHERE id = 1")
+        if rows:
+            result = dict(rows[0])
+            result["strategies_enabled"] = json.loads(result.get("strategies_enabled", "[]"))
+            return result
+
+    return {"status": "updated", "fields": list(updates.keys())}
+
+
+_STRATEGY_NAMES = {
+    "iron_condor": "Iron Condor",
+    "straddle_adjust": "Straddle Sell + Adjust",
+    "directional_spread": "Directional Spread",
+}
+
+
+def _transform_proposal(d: dict) -> dict:
+    """Transform raw DB row to frontend-friendly format."""
+    import json as _json
+    out = dict(d)
+
+    # Add strategy_name
+    out["strategy_name"] = _STRATEGY_NAMES.get(d.get("strategy_id", ""), d.get("strategy_id", ""))
+
+    # Convert confidence 0-1 -> 0-100
+    conf = d.get("confidence", 0)
+    if conf is not None:
+        out["confidence_score"] = round(float(conf) * 100)
+
+    # Parse JSON fields
+    for field in ("legs", "greeks", "intelligence", "risk_checks"):
+        val = d.get(field)
+        if val and isinstance(val, str):
+            try:
+                out[field] = _json.loads(val)
+            except Exception:
+                pass
+
+    # Transform legs to frontend format (action UPPERCASE, type -> option_type)
+    if isinstance(out.get("legs"), list):
+        out["legs"] = [
+            {
+                **leg,
+                "action": str(leg.get("action", "")).upper(),
+                "option_type": leg.get("type", leg.get("option_type", "")),
+            }
+            for leg in out["legs"]
+        ]
+
+    return out
+
+
+def _transform_position(d: dict) -> dict:
+    """Transform position DB row to frontend-friendly format."""
+    import json as _json
+    out = dict(d)
+    out["strategy_name"] = _STRATEGY_NAMES.get(d.get("strategy_id", ""), d.get("strategy_id", ""))
+
+    # Parse legs JSON
+    legs_str = d.get("legs", "[]")
+    legs_list = []
+    if isinstance(legs_str, str):
+        try:
+            legs_list = _json.loads(legs_str)
+        except Exception:
+            legs_list = []
+    elif isinstance(legs_str, list):
+        legs_list = legs_str
+    out["legs"] = legs_list
+
+    # Aliases for frontend
+    out["unrealized_pnl"] = d.get("current_pnl", 0)
+    out["entry_premium"] = d.get("total_premium", 0)
+    # Total quantity = sum of legs (or use first leg qty)
+    out["quantity"] = legs_list[0].get("quantity", 0) if legs_list else 0
+
+    return out
+
+
+@app.get("/api/trading/proposals")
+async def trading_get_proposals(status: str = Query(None)):
+    """List trade proposals. Filter by status (pending, approved, rejected, expired, executed)."""
+    from db.database import _get_db
+    if status:
+        query = "SELECT * FROM trade_proposals WHERE status = ? ORDER BY created_at DESC LIMIT 50"
+        params = (status,)
+    else:
+        query = "SELECT * FROM trade_proposals ORDER BY created_at DESC LIMIT 50"
+        params = ()
+
+    async with _get_db() as db:
+        import aiosqlite
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(query, params)
+        return [_transform_proposal(dict(r)) for r in rows]
+
+
+@app.get("/api/trading/proposals/{proposal_id}")
+async def trading_get_proposal(proposal_id: int):
+    """Get full proposal detail."""
+    from db.database import _get_db
+    import aiosqlite
+    async with _get_db() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM trade_proposals WHERE id = ?", (proposal_id,)
+        )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    return _transform_proposal(dict(rows[0]))
+
+
+@app.post("/api/trading/proposals/{proposal_id}/approve")
+async def trading_approve_proposal(proposal_id: int):
+    """Approve a trade proposal for execution."""
+    from trading.engine import trading_engine
+    result = await trading_engine.execute_approved(proposal_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/trading/proposals/{proposal_id}/reject")
+async def trading_reject_proposal(proposal_id: int):
+    """Reject a trade proposal."""
+    from trading.engine import trading_engine
+    await trading_engine._update_proposal_status(proposal_id, "rejected")
+    return {"status": "rejected"}
+
+
+@app.get("/api/trading/positions")
+async def trading_get_positions(status: str = Query(None)):
+    """List positions. Filter by status (open, closed, stopped_out, target_hit)."""
+    from db.database import _get_db
+    import aiosqlite
+    if status:
+        query = "SELECT * FROM positions WHERE status = ? ORDER BY entry_time DESC LIMIT 50"
+        params = (status,)
+    else:
+        query = "SELECT * FROM positions ORDER BY entry_time DESC LIMIT 50"
+        params = ()
+
+    async with _get_db() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(query, params)
+        return [_transform_position(dict(r)) for r in rows]
+
+
+@app.get("/api/trading/positions/{position_id}")
+async def trading_get_position(position_id: int):
+    """Get position detail with order log."""
+    from db.database import _get_db
+    import aiosqlite
+    async with _get_db() as db:
+        db.row_factory = aiosqlite.Row
+        pos_rows = await db.execute_fetchall(
+            "SELECT * FROM positions WHERE id = ?", (position_id,)
+        )
+        if not pos_rows:
+            raise HTTPException(status_code=404, detail="Position not found")
+
+        order_rows = await db.execute_fetchall(
+            "SELECT * FROM order_log WHERE position_id = ? ORDER BY placed_at", (position_id,)
+        )
+
+    result = _transform_position(dict(pos_rows[0]))
+    result["orders"] = [dict(r) for r in order_rows]
+    return result
+
+
+@app.post("/api/trading/positions/{position_id}/close")
+async def trading_close_position(position_id: int):
+    """Force-close an open position."""
+    from trading.engine import trading_engine
+    result = await trading_engine.close_position(position_id, reason="manual_close")
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/api/trading/pnl")
+async def trading_pnl():
+    """Get daily P&L history + summary."""
+    from db.database import _get_db
+    from datetime import date
+    import aiosqlite
+    async with _get_db() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM daily_pnl ORDER BY date DESC LIMIT 90"
+        )
+        history = [dict(r) for r in rows]
+
+        # Today's P&L
+        today_str = date.today().isoformat()
+        today_row = next((h for h in history if h.get("date") == today_str), None)
+        today_pnl = (today_row.get("realized", 0) + today_row.get("unrealized", 0)) if today_row else 0
+
+        # Sum unrealized from open positions
+        pos_rows = await db.execute_fetchall(
+            "SELECT SUM(current_pnl) as total FROM positions WHERE status = 'open'"
+        )
+        unrealized_now = float(pos_rows[0]["total"] or 0) if pos_rows else 0
+
+        # Total realized P&L all-time
+        all_rows = await db.execute_fetchall("SELECT SUM(realized) as total FROM daily_pnl")
+        total_realized = float(all_rows[0]["total"] or 0) if all_rows else 0
+
+        return {
+            "today_pnl": round(today_pnl + unrealized_now, 2),
+            "total_pnl": round(total_realized + unrealized_now, 2),
+            "unrealized_pnl": round(unrealized_now, 2),
+            "history": history,
+        }
+
+
+@app.get("/api/trading/performance")
+async def trading_performance():
+    """Get per-strategy performance stats."""
+    from db.database import _get_db
+    import aiosqlite
+    async with _get_db() as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall("""
+            SELECT strategy_id,
+                   COUNT(*) as total_trades,
+                   SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END) as losses,
+                   SUM(realized_pnl) as total_pnl,
+                   AVG(realized_pnl) as avg_pnl
+            FROM positions
+            WHERE status != 'open'
+            GROUP BY strategy_id
+        """)
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["win_rate"] = round(d["wins"] / d["total_trades"] * 100, 1) if d["total_trades"] > 0 else 0
+            results.append(d)
+        return results
+
+
+@app.get("/api/trading/intelligence/{symbol}")
+async def trading_intelligence(symbol: str):
+    """Get full market intelligence snapshot for a symbol."""
+    from data.options import get_option_chain
+    from trading.intelligence import get_market_snapshot
+
+    symbol = symbol.upper().strip()
+    option_data = await asyncio.to_thread(get_option_chain, symbol)
+    snapshot = await get_market_snapshot(symbol, option_data)
+    return snapshot
+
+
+@app.get("/api/trading/events")
+async def trading_events():
+    """Get upcoming market events."""
+    from trading.events import get_upcoming_events
+    return get_upcoming_events(days_ahead=14)
+
+
+@app.post("/api/trading/circuit-breaker/reset")
+async def trading_reset_circuit_breaker():
+    """Manually reset the daily loss circuit breaker."""
+    from db.database import _get_db
+    from datetime import date
+    today = date.today().isoformat()
+    async with _get_db() as db:
+        await db.execute(
+            "UPDATE daily_pnl SET realized = 0, unrealized = 0 WHERE date = ?",
+            (today,),
+        )
+        await db.commit()
+    return {"status": "circuit_breaker_reset", "date": today}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket for trading notifications
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/trading")
+async def trading_websocket(websocket: WebSocket):
+    """WebSocket endpoint for real-time trading updates."""
+    from trading.engine import trading_engine
+    await websocket.accept()
+    trading_engine.register_ws(websocket)
+
+    try:
+        # Send initial status
+        await websocket.send_json({"type": "engine_status", **trading_engine.status})
+        # Keep connection alive
+        while True:
+            data = await websocket.receive_text()
+            # Client can send ping/pong or commands
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        trading_engine.unregister_ws(websocket)
+    except Exception:
+        trading_engine.unregister_ws(websocket)
