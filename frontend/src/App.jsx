@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
+import { useState, useEffect } from 'react'
 import Dashboard from './components/Dashboard'
 import StockAnalysis from './components/StockAnalysis'
 import StrategyList from './components/StrategyList'
@@ -10,6 +11,47 @@ import OptionChain from './components/OptionChain'
 import MCXCommodities from './components/MCXCommodities'
 import PredefinedStrategies from './components/PredefinedStrategies'
 import StockSearch from './components/StockSearch'
+import TradingDashboard from './components/trading/TradingDashboard'
+import TradeApproval from './components/trading/TradeApproval'
+import TradingSettings from './components/trading/TradingSettings'
+import TradeHistory from './components/trading/TradeHistory'
+import PositionMonitor from './components/trading/PositionMonitor'
+
+const API_BASE = 'http://localhost:8000'
+
+function TradingNavLink({ className }) {
+  const [engineRunning, setEngineRunning] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function checkStatus() {
+      try {
+        const res = await fetch(`${API_BASE}/api/trading/status`)
+        if (res.ok && !cancelled) {
+          const data = await res.json()
+          setEngineRunning(data.running ?? false)
+        }
+      } catch { /* ignore — backend may not be up */ }
+    }
+
+    checkStatus()
+    // Poll every 30 seconds for engine status
+    const interval = setInterval(checkStatus, 30000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [])
+
+  return (
+    <NavLink to="/trading" className={className}>
+      <span className="flex items-center gap-1.5">
+        {engineRunning && (
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+        )}
+        Trading
+      </span>
+    </NavLink>
+  )
+}
 
 function NavBar() {
   const linkClass = ({ isActive }) =>
@@ -24,6 +66,7 @@ function NavBar() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2 flex items-center justify-between">
         <div className="flex items-center gap-0.5 overflow-x-auto">
           <NavLink to="/" className={linkClass}>Dashboard</NavLink>
+          <TradingNavLink className={linkClass} />
           <NavLink to="/options" className={linkClass}>Options</NavLink>
           <NavLink to="/mcx" className={linkClass}>MCX</NavLink>
           <NavLink to="/history" className={linkClass}>History</NavLink>
@@ -55,6 +98,12 @@ export default function App() {
           <Route path="/strategies/:id" element={<StrategyBuilder />} />
           <Route path="/alerts" element={<AlertsPanel />} />
           <Route path="/glossary" element={<IndicatorGlossary />} />
+          {/* Trading routes */}
+          <Route path="/trading" element={<TradingDashboard />} />
+          <Route path="/trading/approve/:id" element={<TradeApproval />} />
+          <Route path="/trading/settings" element={<TradingSettings />} />
+          <Route path="/trading/history" element={<TradeHistory />} />
+          <Route path="/trading/positions" element={<PositionMonitor />} />
         </Routes>
       </div>
     </BrowserRouter>
