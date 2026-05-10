@@ -1218,6 +1218,387 @@ async def trading_reset_circuit_breaker():
 
 
 # ---------------------------------------------------------------------------
+# IT-Bear Module API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/it-bear/universe")
+async def it_bear_universe():
+    """
+    List of IT stocks with current price + key metadata.
+    Combines static universe data + current prices via yfinance.
+    """
+    from data.it_universe import get_all
+    from analysis.it_sector_health import get_sector_heatmap
+
+    stocks = get_all()
+    # Enrich with live prices from sector heatmap (cached 15min)
+    try:
+        heatmap = await get_sector_heatmap()
+        price_map = {s["symbol"]: s for s in heatmap}
+    except Exception:
+        price_map = {}
+
+    result = []
+    for s in stocks:
+        sym = s["symbol"]
+        live = price_map.get(sym, {})
+        result.append({
+            "symbol": sym,
+            "name": s.get("name", sym),
+            "country": s.get("country", ""),
+            "tier": s.get("tier", ""),
+            "segment": s.get("segment", ""),
+            "lot_size": s.get("lot_size"),
+            "fno": s.get("fno", False),
+            "notes": s.get("notes", ""),
+            "yf": s.get("yf", sym),
+            "price": live.get("price"),
+            "change_pct_1d": live.get("change_pct_1d"),
+            "change_pct_5d": live.get("change_pct_5d"),
+            "change_pct_20d": live.get("change_pct_20d"),
+            "rsi": live.get("rsi"),
+            "above_50dma": live.get("above_50dma"),
+        })
+
+    return result
+
+
+@app.get("/api/it-bear/universe/{symbol}")
+async def it_bear_stock_detail(symbol: str):
+    """Single stock: full details + last 4 quarters + indicators."""
+    from data.it_universe import get_by_symbol
+    from data.earnings_calendar import get_next_earnings, get_quarterly_history
+    from analysis.it_sector_health import _fetch_stock_indicators
+
+    symbol = symbol.upper().strip()
+    stock = get_by_symbol(symbol)
+    if not stock:
+        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not in IT universe")
+
+    yf_sym = stock.get("yf", symbol)
+
+    # Fetch indicators, earnings info concurrently
+    indicators_task = asyncio.to_thread(
+        _fetch_stock_indicators, yf_sym, symbol,
+        stock.get("name", symbol), stock.get("country", "")
+    )
+    earnings_task = get_next_earnings(symbol)
+    history_task = get_quarterly_history(symbol, num_quarters=4)
+
+    indicators, earnings, quarterly = await asyncio.gather(
+        indicators_task, earnings_task, history_task, return_exceptions=True
+    )
+
+    return {
+        **stock,
+        "indicators": indicators if not isinstance(indicators, Exception) else {},
+        "next_earnings": earnings if not isinstance(earnings, Exception) else None,
+        "quarterly_history": quarterly if not isinstance(quarterly, Exception) else [],
+    }
+
+
+@app.get("/api/it-bear/earnings")
+async def it_bear_earnings(days_ahead: int = Query(90, ge=1, le=365)):
+    """Upcoming earnings calendar for IT universe."""
+    from data.earnings_calendar import get_universe_earnings_calendar
+    return await get_universe_earnings_calendar(days_ahead=days_ahead)
+
+
+@app.get("/api/it-bear/sector-health")
+async def it_bear_sector_health():
+    """NIFTY IT vs NIFTY 50, macro indicators, and sector heatmap."""
+    from analysis.it_sector_health import (
+        get_nifty_it_vs_nifty50, get_macro_indicators,
+        get_sector_heatmap, get_sector_health_summary,
+    )
+
+    summary, rs_data, macro, heatmap = await asyncio.gather(
+        get_sector_health_summary(),
+        get_nifty_it_vs_nifty50(),
+        get_macro_indicators(),
+        get_sector_heatmap(),
+        return_exceptions=True,
+    )
+
+    return {
+        "summary": summary if not isinstance(summary, Exception) else {},
+        "nifty_it_vs_nifty50": rs_data if not isinstance(rs_data, Exception) else {},
+        "macro": macro if not isinstance(macro, Exception) else {},
+        "heatmap": heatmap if not isinstance(heatmap, Exception) else [],
+    }
+
+
+@app.get("/api/it-bear/scanner")
+async def it_bear_scanner():
+    """
+    Run all 5 IT-bear evaluators against all IT stocks.
+    Returns ranked signals sorted by confidence descending.
+    """
+    from data.it_universe import get_india
+    from data.synthetic_options import generate_synthetic_chain
+    from trading.strategies_it_bear import ALL_IT_BEAR_EVALUATORS
+
+    stocks = get_india()
+    # Reuse the NIFTY IT chain as base for all stocks
+    try:
+        niftyit_chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+    except Exception:
+        niftyit_chain = {"strikes": [], "spot_price": 0, "pcr": 0, "strike_count": 0}
+
+    signals = []
+
+    async def _scan_stock(stock: dict):
+        sym = stock["symbol"]
+        yf_sym = stock.get("yf", sym)
+
+        # Try stock-specific chain, fallback to NIFTY IT chain
+        try:
+            from data.synthetic_options import get_chain_with_fallback
+            chain = await asyncio.to_thread(get_chain_with_fallback, sym, True)
+            if chain.get("strike_count", 0) == 0:
+                chain = niftyit_chain
+        except Exception:
+            chain = niftyit_chain
+
+        spot = chain.get("spot_price", 0)
+        snapshot = {
+            "symbol": sym,
+            "spot": spot,
+            "vix": chain.get("vix", 0),
+            "vix_regime": "unknown",
+            "pcr": chain.get("pcr", 0),
+            "atm": {},
+            "expected_move": 0,
+            "max_pain": 0,
+            "oi_levels": {"support": 0, "resistance": 0},
+            "iv_percentile": -1,
+            "nearest_expiry": "",
+            "days_to_expiry": 28,
+            "greeks": {},
+        }
+
+        stock_signals = []
+        for evaluator in ALL_IT_BEAR_EVALUATORS:
+            try:
+                proposal = await evaluator.evaluate(snapshot, chain)
+                if proposal:
+                    proposal["stock_meta"] = {
+                        "name": stock.get("name", sym),
+                        "tier": stock.get("tier", ""),
+                        "segment": stock.get("segment", ""),
+                    }
+                    stock_signals.append(proposal)
+            except Exception as e:
+                print(f"[scanner] {evaluator.strategy_id} on {sym}: {e}")
+
+        return stock_signals
+
+    tasks = [_scan_stock(s) for s in stocks]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in all_results:
+        if isinstance(result, list):
+            signals.extend(result)
+
+    # Sort by confidence descending
+    signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+
+    return {
+        "signals": signals,
+        "total": len(signals),
+        "scanned_symbols": len(stocks),
+        "evaluators_run": len(ALL_IT_BEAR_EVALUATORS),
+    }
+
+
+@app.get("/api/it-bear/strategy-suggest/{symbol}")
+async def it_bear_suggest_strategy(
+    symbol: str,
+    conviction: str = Query("moderate", regex="^(low|moderate|high)$"),
+    horizon_days: int = Query(30, ge=5, le=90),
+):
+    """
+    Suggest specific option structure for a name given conviction + horizon.
+    conviction: low | moderate | high
+    horizon_days: 5-90
+    """
+    from data.it_universe import get_by_symbol
+    from data.synthetic_options import generate_synthetic_chain, get_chain_with_fallback
+    from trading.strategies_it_bear import (
+        LongPutBreakdownEvaluator, BearPutSpreadEvaluator,
+        BearCallSpreadEvaluator, PreEarningsLongPutEvaluator,
+        NiftyITFuturesShortEvaluator,
+    )
+
+    symbol = symbol.upper().strip()
+    stock = get_by_symbol(symbol)
+
+    if not stock and symbol not in ("NIFTYIT", "NIFTY IT"):
+        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not in IT universe")
+
+    # Get chain
+    try:
+        chain = await asyncio.to_thread(get_chain_with_fallback, symbol, True)
+        if chain.get("strike_count", 0) == 0:
+            chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+    except Exception:
+        chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+
+    spot = chain.get("spot_price", 0)
+    snapshot = {
+        "symbol": symbol,
+        "spot": spot,
+        "vix": chain.get("vix", 0),
+        "vix_regime": "unknown",
+        "pcr": chain.get("pcr", 0),
+        "atm": {},
+        "expected_move": 0,
+        "max_pain": 0,
+        "oi_levels": {"support": 0, "resistance": 0},
+        "iv_percentile": -1,
+        "nearest_expiry": "",
+        "days_to_expiry": horizon_days,
+        "greeks": {},
+    }
+
+    # Strategy recommendation logic based on conviction + horizon
+    strategy_map = {
+        # (conviction, horizon) -> preferred evaluator
+        ("high", "short"): NiftyITFuturesShortEvaluator() if symbol == "NIFTYIT" else LongPutBreakdownEvaluator(),
+        ("high", "medium"): BearPutSpreadEvaluator(),
+        ("high", "long"): LongPutBreakdownEvaluator(),
+        ("moderate", "short"): BearCallSpreadEvaluator(),
+        ("moderate", "medium"): BearPutSpreadEvaluator(),
+        ("moderate", "long"): PreEarningsLongPutEvaluator(),
+        ("low", "short"): BearCallSpreadEvaluator(),
+        ("low", "medium"): BearCallSpreadEvaluator(),
+        ("low", "long"): BearPutSpreadEvaluator(),
+    }
+
+    horizon_bucket = "short" if horizon_days <= 14 else "medium" if horizon_days <= 30 else "long"
+    evaluator = strategy_map.get((conviction, horizon_bucket), BearPutSpreadEvaluator())
+
+    suggestions = []
+    # Try preferred evaluator first, then others
+    all_evals = [evaluator, LongPutBreakdownEvaluator(), BearPutSpreadEvaluator(),
+                 BearCallSpreadEvaluator(), PreEarningsLongPutEvaluator()]
+
+    seen_ids = set()
+    for ev in all_evals:
+        if ev.strategy_id in seen_ids:
+            continue
+        seen_ids.add(ev.strategy_id)
+        try:
+            proposal = await ev.evaluate(snapshot, chain)
+            if proposal:
+                proposal["recommended_for"] = {
+                    "conviction": conviction,
+                    "horizon_days": horizon_days,
+                    "is_primary_suggestion": ev.strategy_id == evaluator.strategy_id,
+                }
+                suggestions.append(proposal)
+        except Exception as e:
+            print(f"[suggest] {ev.strategy_id} on {symbol}: {e}")
+
+        if len(suggestions) >= 3:
+            break
+
+    return {
+        "symbol": symbol,
+        "conviction": conviction,
+        "horizon_days": horizon_days,
+        "suggestions": suggestions,
+        "primary_strategy": evaluator.strategy_name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Notification Management API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications/config")
+async def notification_config():
+    """
+    Get notification channel configuration status.
+    Returns which channels are configured (without exposing credentials).
+    """
+    import os
+    return {
+        "email": {
+            "configured": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS")),
+            "recipient": os.getenv("NOTIFY_EMAIL") or os.getenv("SMTP_USER", ""),
+            "smtp_host": os.getenv("SMTP_HOST", ""),
+        },
+        "telegram": {
+            "configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
+            "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+        },
+        "websocket": {
+            "configured": True,  # Always available
+        },
+    }
+
+
+@app.put("/api/notifications/config")
+async def update_notification_config(body: dict):
+    """
+    Update notification channel preferences.
+    Accepts: notify_email, telegram_chat_id, smtp_host, smtp_port, smtp_user.
+    Note: Credentials are NOT stored in DB — use .env file for security.
+    For UI toggle only (enable/disable channels in trading_config).
+    """
+    from db.database import _get_db
+
+    allowed = {"it_bear_enabled", "auto_layer_core", "auto_layer_tactical",
+               "auto_layer_us", "auto_layer_hedge"}
+
+    updates = {k: (1 if v else 0) for k, v in body.items() if k in allowed}
+
+    if not updates:
+        return {"status": "no_changes", "note": "Set SMTP/Telegram credentials in .env file"}
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values())
+
+    async with _get_db() as db:
+        await db.execute(
+            f"UPDATE trading_config SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            values,
+        )
+        await db.commit()
+
+    # Update engine's in-memory layer config
+    from trading.engine import trading_engine
+    for key, val in updates.items():
+        if key.startswith("auto_layer_"):
+            layer = key.replace("auto_layer_", "")
+            trading_engine.auto_execute_layers[layer] = bool(val)
+
+    return {"status": "updated", "fields": list(updates.keys())}
+
+
+@app.post("/api/notifications/test/{channel}")
+async def test_notification(channel: str):
+    """
+    Send a test message to a specific channel.
+    channel: email | telegram | websocket | all
+    """
+    if channel not in ("email", "telegram", "websocket", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid channel '{channel}'. Use: email, telegram, websocket, all"
+        )
+
+    from notifications.dispatcher import send_test_notification
+    results = await send_test_notification(channel)
+    return {
+        "channel": channel,
+        "results": results,
+        "any_success": any(results.values()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # WebSocket for trading notifications
 # ---------------------------------------------------------------------------
 

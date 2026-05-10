@@ -19,6 +19,21 @@ from trading.intelligence import get_market_snapshot
 from trading.broker import get_broker, PaperBroker
 from trading.orders import OrderManager
 
+# IT-Bear evaluators (imported lazily to avoid circular deps at module load)
+_IT_BEAR_EVALUATORS = None
+
+
+def _get_it_bear_evaluators():
+    global _IT_BEAR_EVALUATORS
+    if _IT_BEAR_EVALUATORS is None:
+        try:
+            from trading.strategies_it_bear import ALL_IT_BEAR_EVALUATORS
+            _IT_BEAR_EVALUATORS = ALL_IT_BEAR_EVALUATORS
+        except Exception as e:
+            print(f"[TradingEngine] IT-Bear evaluators not loaded: {e}")
+            _IT_BEAR_EVALUATORS = []
+    return _IT_BEAR_EVALUATORS
+
 
 class TradingEngine:
     """
@@ -40,6 +55,13 @@ class TradingEngine:
         self._ws_clients: list = []  # WebSocket connections for notifications
         self._broker = None
         self._order_manager = None
+        # IT-Bear layer config: {layer_name: auto_execute_enabled}
+        self.auto_execute_layers: dict[str, bool] = {
+            "core": False,
+            "tactical": False,
+            "us": False,
+            "hedge": False,
+        }
 
     @property
     def is_running(self) -> bool:
@@ -212,6 +234,123 @@ class TradingEngine:
             except Exception as e:
                 print(f"[TradingEngine] Error processing {symbol}: {e}")
                 blocked_reasons.append(f"{symbol}: {str(e)[:100]}")
+
+        # ── IT-Bear scan: run evaluators over IT universe ──────────────────
+        it_bear_enabled = bool(config.get("it_bear_enabled", 1))
+        it_evaluators = _get_it_bear_evaluators()
+
+        if it_bear_enabled and it_evaluators:
+            try:
+                from data.it_universe import get_india
+                from data.synthetic_options import generate_synthetic_chain
+
+                it_stocks = get_india()  # 12 Indian IT names + NIFTY IT index
+
+                # Reload auto-execute layer config from DB config
+                self.auto_execute_layers = {
+                    "core": bool(config.get("auto_layer_core", 0)),
+                    "tactical": bool(config.get("auto_layer_tactical", 0)),
+                    "us": bool(config.get("auto_layer_us", 0)),
+                    "hedge": bool(config.get("auto_layer_hedge", 0)),
+                }
+
+                for stock in it_stocks:
+                    sym = stock["symbol"]
+                    yf_sym = stock.get("yf", sym)
+
+                    try:
+                        # Synthetic chain for IT stocks (single-stock options)
+                        # Falls back to NIFTY IT chain if stock chain unavailable
+                        from data.synthetic_options import get_chain_with_fallback as _gcwf
+                        try:
+                            it_chain = await asyncio.to_thread(
+                                _gcwf, sym, paper_mode
+                            )
+                            if it_chain.get("strike_count", 0) == 0:
+                                it_chain = await asyncio.to_thread(
+                                    generate_synthetic_chain, "NIFTYIT"
+                                )
+                        except Exception:
+                            it_chain = await asyncio.to_thread(
+                                generate_synthetic_chain, "NIFTYIT"
+                            )
+
+                        # Build minimal snapshot for this stock
+                        spot = it_chain.get("spot_price", 0)
+                        it_snapshot = {
+                            "symbol": sym,
+                            "spot": spot,
+                            "vix": it_chain.get("vix", 0),
+                            "vix_regime": "unknown",
+                            "pcr": it_chain.get("pcr", 0),
+                            "atm": {},
+                            "expected_move": 0,
+                            "max_pain": 0,
+                            "oi_levels": {"support": 0, "resistance": 0},
+                            "iv_percentile": -1,
+                            "nearest_expiry": "",
+                            "days_to_expiry": 28,
+                            "greeks": {},
+                        }
+
+                        # Run each IT-bear evaluator
+                        for evaluator in it_evaluators:
+                            try:
+                                proposal = await evaluator.evaluate(
+                                    it_snapshot, it_chain, indicators=None
+                                )
+                                if proposal:
+                                    risk_results = await run_risk_checks(proposal, config)
+                                    proposal["risk_checks"] = json.dumps(risk_results)
+
+                                    if all_checks_passed(risk_results):
+                                        proposal["status"] = "pending"
+                                        proposal_id = await self._save_proposal(proposal)
+                                        proposal["id"] = proposal_id
+
+                                        # Fan out via dispatcher (not just WebSocket)
+                                        try:
+                                            from notifications.dispatcher import notify_trade_alert
+                                            asyncio.create_task(notify_trade_alert(proposal))
+                                        except Exception as ne:
+                                            print(f"[TradingEngine] Dispatcher error: {ne}")
+                                            # Fallback to direct WS
+                                            await self._notify_clients({
+                                                "type": "new_proposal",
+                                                "proposal": proposal,
+                                            })
+
+                                        # Auto-execute if layer is enabled
+                                        layer = proposal.get("intelligence", {}).get("layer", "")
+                                        if self.auto_execute_layers.get(layer, False):
+                                            try:
+                                                await self.execute_approved(proposal_id)
+                                                print(f"[TradingEngine] Auto-executed {evaluator.strategy_name} "
+                                                      f"on {sym} (layer={layer})")
+                                            except Exception as ae:
+                                                print(f"[TradingEngine] Auto-execute failed: {ae}")
+
+                                        all_signals.append(proposal)
+                                        print(f"[TradingEngine] IT-Bear: {evaluator.strategy_name} "
+                                              f"on {sym} ({proposal['confidence']:.0%})")
+                                    else:
+                                        failed = [r for r in risk_results if not r["passed"]]
+                                        blocked_reasons.append(
+                                            f"IT-Bear/{evaluator.strategy_id}/{sym}: "
+                                            f"blocked by {', '.join(r['check'] for r in failed)}"
+                                        )
+                            except Exception as e:
+                                print(f"[TradingEngine] IT-Bear evaluator {evaluator.strategy_id} "
+                                      f"error on {sym}: {e}")
+
+                    except Exception as e:
+                        print(f"[TradingEngine] IT-Bear error for {sym}: {e}")
+                        blocked_reasons.append(f"IT-Bear/{sym}: {str(e)[:80]}")
+
+            except Exception as e:
+                print(f"[TradingEngine] IT-Bear scan block failed: {e}")
+
+        # ── End IT-Bear scan ────────────────────────────────────────────────
 
         duration_ms = int((time.time() - start_time) * 1000)
 

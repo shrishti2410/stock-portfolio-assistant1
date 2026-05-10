@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import Dashboard from './components/Dashboard'
 import StockAnalysis from './components/StockAnalysis'
@@ -16,6 +16,18 @@ import TradeApproval from './components/trading/TradeApproval'
 import TradingSettings from './components/trading/TradingSettings'
 import TradeHistory from './components/trading/TradeHistory'
 import PositionMonitor from './components/trading/PositionMonitor'
+
+// IT-Bear components
+import {
+  SectorDashboard,
+  EarningsCalendar,
+  ITUniverse,
+  StockDetail as ITStockDetail,
+  StrategyBuilder as ITStrategyBuilder,
+  Scanner,
+  NotificationSettings,
+  USSignals,
+} from './components/it-bear'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -53,6 +65,32 @@ function TradingNavLink({ className }) {
   )
 }
 
+function ITBearNavLink({ className }) {
+  // Derive isActive ourselves so we can still apply className
+  const location = useLocation()
+  const isActive = location.pathname.startsWith('/it-bear')
+
+  return (
+    <NavLink
+      to="/it-bear"
+      className={({ isActive: routerActive }) => {
+        const active = routerActive || isActive
+        return `px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
+          active
+            ? 'bg-red-500/20 border border-red-500/30 text-red-300'
+            : 'text-slate-400 hover:text-red-300 hover:bg-red-500/10 border border-transparent'
+        }`
+      }}
+      end={false}
+    >
+      <span className="flex items-center gap-1.5">
+        <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+        IT Bear
+      </span>
+    </NavLink>
+  )
+}
+
 function NavBar() {
   const linkClass = ({ isActive }) =>
     `px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
@@ -65,8 +103,9 @@ function NavBar() {
     <nav className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-20">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2 flex items-center justify-between">
         <div className="flex items-center gap-0.5 overflow-x-auto">
-          <NavLink to="/" className={linkClass}>Dashboard</NavLink>
+          <NavLink to="/" end className={linkClass}>Dashboard</NavLink>
           <TradingNavLink className={linkClass} />
+          <ITBearNavLink />
           <NavLink to="/options" className={linkClass}>Options</NavLink>
           <NavLink to="/mcx" className={linkClass}>MCX</NavLink>
           <NavLink to="/history" className={linkClass}>History</NavLink>
@@ -87,6 +126,7 @@ export default function App() {
       <div className="min-h-screen bg-[#0f172a] text-slate-100 font-sans">
         <NavBar />
         <Routes>
+          {/* Core routes */}
           <Route path="/" element={<Dashboard />} />
           <Route path="/stock/:symbol" element={<StockAnalysis />} />
           <Route path="/options" element={<OptionChain />} />
@@ -98,12 +138,24 @@ export default function App() {
           <Route path="/strategies/:id" element={<StrategyBuilder />} />
           <Route path="/alerts" element={<AlertsPanel />} />
           <Route path="/glossary" element={<IndicatorGlossary />} />
+
           {/* Trading routes */}
           <Route path="/trading" element={<TradingDashboard />} />
           <Route path="/trading/approve/:id" element={<TradeApproval />} />
           <Route path="/trading/settings" element={<TradingSettings />} />
           <Route path="/trading/history" element={<TradeHistory />} />
           <Route path="/trading/positions" element={<PositionMonitor />} />
+
+          {/* IT-Bear routes */}
+          <Route path="/it-bear" element={<SectorDashboard />} />
+          <Route path="/it-bear/earnings" element={<EarningsCalendar />} />
+          <Route path="/it-bear/universe" element={<ITUniverse />} />
+          <Route path="/it-bear/stock/:symbol" element={<ITStockDetail />} />
+          <Route path="/it-bear/strategy-builder" element={<ITStrategyBuilder />} />
+          <Route path="/it-bear/strategy-builder/:symbol" element={<ITStrategyBuilder />} />
+          <Route path="/it-bear/scanner" element={<Scanner />} />
+          <Route path="/it-bear/notifications" element={<NotificationSettings />} />
+          <Route path="/it-bear/us-signals" element={<USSignals />} />
         </Routes>
       </div>
     </BrowserRouter>

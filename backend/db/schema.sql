@@ -189,3 +189,60 @@ CREATE TABLE IF NOT EXISTS order_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_log_position ON order_log(position_id);
+
+-- ============================================================
+-- IT-BEAR MODULE ADDITIONS
+-- ============================================================
+
+-- Per-layer auto-execution toggle (appended to trading_config)
+-- SQLite ALTER TABLE only allows ADD COLUMN, and only if column doesn't exist.
+-- We use a safe migration pattern with INSERT OR IGNORE + UPDATE.
+CREATE TABLE IF NOT EXISTS _migration_guard (
+    migration_key TEXT PRIMARY KEY,
+    applied_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add IT-bear layer toggle columns to trading_config (idempotent via trigger approach)
+-- SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we catch errors in init_db().
+-- These columns are declared here as documentation; actual migration is in database.py.
+
+-- Earnings calendar cache
+CREATE TABLE IF NOT EXISTS earnings_calendar (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT    NOT NULL,
+    earnings_date TEXT,
+    fetched_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_calendar_symbol ON earnings_calendar(symbol);
+
+-- Earnings history (last 4 quarters per symbol)
+CREATE TABLE IF NOT EXISTS earnings_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT    NOT NULL,
+    period          TEXT    NOT NULL,
+    revenue         REAL,
+    earnings        REAL,
+    eps             REAL,
+    revenue_yoy_pct REAL,
+    fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_history_symbol ON earnings_history(symbol, period);
+
+-- Notification log (all channels)
+CREATE TABLE IF NOT EXISTS notification_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    type          TEXT    NOT NULL,      -- "trade_alert" | "daily_brief" | "risk_alert" | "test"
+    channel       TEXT    NOT NULL,      -- "email" | "telegram" | "websocket"
+    subject       TEXT,
+    body          TEXT,
+    success       INTEGER DEFAULT 0,     -- 1 = sent, 0 = failed / not configured
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_log_sent ON notification_log(sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_log_channel ON notification_log(channel, success);
