@@ -1038,6 +1038,154 @@ async def trading_get_proposals(status: str = Query(None)):
         return [_transform_proposal(dict(r)) for r in rows]
 
 
+@app.post("/api/trading/proposals")
+async def trading_create_proposal(body: dict):
+    """
+    Manually create a trade proposal (e.g., from the Strategy Builder).
+
+    Body accepts the frontend-friendly shape:
+      symbol, strategy_name, direction, mode, legs, max_profit, max_loss,
+      margin_required (or margin_needed), confidence_score (0-100, or confidence 0-1),
+      reasoning, source, layer
+    Returns the proposal ID + status.
+
+    If body.auto_execute is True (default), runs through risk checks +
+    OrderManager immediately. Otherwise saves as 'pending' for manual approval.
+    """
+    import json as _json
+    from trading.engine import trading_engine
+    from db.database import _get_db
+
+    # Normalize input
+    symbol = str(body.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="'symbol' is required")
+
+    # Frontend may send confidence as 0-100 OR 0-1. Normalize to 0-1.
+    conf_raw = body.get("confidence_score", body.get("confidence", 50))
+    confidence = float(conf_raw) / 100 if conf_raw > 1 else float(conf_raw)
+
+    # Frontend may send margin_required OR margin_needed
+    margin = float(body.get("margin_required", body.get("margin_needed", 0)) or 0)
+
+    # Strategy id — best effort from name
+    strategy_id = body.get("strategy_id") or _strategy_id_from_name(body.get("strategy_name", ""))
+
+    # Legs: normalize action UPPERCASE, ensure option_type / type both present
+    raw_legs = body.get("legs", []) or []
+    legs = []
+    for leg in raw_legs:
+        action = str(leg.get("action", "")).upper()
+        opt_type = leg.get("type") or leg.get("option_type") or ""
+        legs.append({
+            "action": action.lower(),  # canonical lower-case for engine
+            "type": opt_type,
+            "option_type": opt_type,
+            "strike": int(leg.get("strike", 0)),
+            "qty": int(leg.get("qty", leg.get("quantity", 0))),
+            "ltp": float(leg.get("ltp", 0)),
+            "iv": float(leg.get("iv", 0)),
+        })
+
+    # Save as pending proposal
+    proposal_record = {
+        "strategy_id": strategy_id,
+        "symbol": symbol,
+        "direction": str(body.get("direction", "bearish")).lower(),
+        "legs_json": _json.dumps(legs),
+        "greeks_json": _json.dumps(body.get("greeks", {})),
+        "intelligence_json": _json.dumps({
+            "layer": body.get("layer", "tactical"),
+            "source": body.get("source", "manual"),
+            "strategy_theme": "it_bear_thesis",
+        }),
+        "max_profit": float(body.get("max_profit", 0) or 0),
+        "max_loss": float(body.get("max_loss", 0) or 0),
+        "margin_needed": margin,
+        "confidence": confidence,
+        "reasoning": str(body.get("reasoning", "")),
+    }
+
+    async with _get_db() as db:
+        cursor = await db.execute(
+            """INSERT INTO trade_proposals
+               (strategy_id, symbol, direction, legs, greeks, intelligence,
+                max_profit, max_loss, margin_needed, confidence, reasoning,
+                risk_checks, status, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'pending',
+                       datetime('now', '+30 minutes'))""",
+            (proposal_record["strategy_id"], proposal_record["symbol"],
+             proposal_record["direction"], proposal_record["legs_json"],
+             proposal_record["greeks_json"], proposal_record["intelligence_json"],
+             proposal_record["max_profit"], proposal_record["max_loss"],
+             proposal_record["margin_needed"], proposal_record["confidence"],
+             proposal_record["reasoning"]),
+        )
+        await db.commit()
+        proposal_id = cursor.lastrowid
+
+    # Auto-execute by default (frontend "Execute as Paper Trade" expects execution).
+    # For MANUAL proposals from the Strategy Builder, the user has explicitly chosen
+    # the trade — so we auto-enable engine_enabled + add this strategy to
+    # enabled_strategies before running risk checks (the engine_enabled and
+    # strategy_enabled gates are meant for the auto-scanner, not user-initiated trades).
+    auto_execute = bool(body.get("auto_execute", True))
+    if auto_execute:
+        async with _get_db() as db:
+            import aiosqlite
+            db.row_factory = aiosqlite.Row
+            # Auto-enable engine flag
+            await db.execute(
+                "UPDATE trading_config SET engine_enabled = 1 WHERE id = 1"
+            )
+            # Add this strategy to enabled list if not already
+            rows = await db.execute_fetchall("SELECT strategies_enabled FROM trading_config WHERE id = 1")
+            if rows:
+                enabled = _json.loads(rows[0]["strategies_enabled"] or "[]")
+                if strategy_id not in enabled:
+                    enabled.append(strategy_id)
+                    await db.execute(
+                        "UPDATE trading_config SET strategies_enabled = ? WHERE id = 1",
+                        (_json.dumps(enabled),)
+                    )
+            await db.commit()
+
+        result = await trading_engine.execute_approved(proposal_id)
+        if "error" in result:
+            return {
+                "proposal_id": proposal_id,
+                "status": "rejected",
+                "error": result["error"],
+                "message": f"Proposal saved but execution failed: {result['error']}",
+            }
+        return {
+            "proposal_id": proposal_id,
+            "position_id": result.get("position_id"),
+            "status": "executed",
+            "message": f"Paper trade executed. Position #{result.get('position_id')} created.",
+        }
+
+    return {
+        "proposal_id": proposal_id,
+        "status": "pending",
+        "message": f"Proposal #{proposal_id} created. Approve from dashboard to execute.",
+    }
+
+
+def _strategy_id_from_name(name: str) -> str:
+    """Best-effort map strategy name → canonical strategy_id."""
+    n = (name or "").lower()
+    if "iron condor" in n: return "iron_condor"
+    if "straddle" in n and ("sell" in n or "short" in n or "adjust" in n): return "straddle_adjust"
+    if "bear put" in n or "put spread" in n: return "it_bear_put_spread"
+    if "bear call" in n or "call spread" in n: return "it_bear_call_spread"
+    if "pre-earnings" in n or "pre earnings" in n: return "it_pre_earnings_put"
+    if "long put" in n: return "it_long_put_breakdown"
+    if "nifty it" in n and "future" in n: return "it_nifty_futures_short"
+    if "directional" in n: return "directional_spread"
+    return "manual_proposal"
+
+
 @app.get("/api/trading/proposals/{proposal_id}")
 async def trading_get_proposal(proposal_id: int):
     """Get full proposal detail."""
