@@ -101,9 +101,10 @@ function ReturnChip({ label, value }) {
 }
 
 function HeatmapRow({ stock }) {
-  const chg1d = stock.change_1d ?? 0
-  const chg5d = stock.change_5d ?? 0
-  const chg20d = stock.change_20d ?? 0
+  // Backend returns change_pct_1d / change_pct_5d / change_pct_20d
+  const chg1d = stock.change_pct_1d ?? stock.change_1d ?? 0
+  const chg5d = stock.change_pct_5d ?? stock.change_5d ?? 0
+  const chg20d = stock.change_pct_20d ?? stock.change_20d ?? 0
   const rsi = stock.rsi ?? null
   const above50 = stock.above_50dma
 
@@ -180,14 +181,47 @@ export default function SectorDashboard() {
     return () => clearInterval(id)
   }, [fetchHealth])
 
-  const macro = health?.macro ?? {}
-  const niftyItReturns = health?.nifty_it_returns ?? {}
-  const nifty50Returns = health?.nifty50_returns ?? {}
+  // Backend response structure:
+  //   { summary: { thesis_score, regime, key_signals, ... },
+  //     nifty_it_vs_nifty50: { nifty_it_pct_5d, nifty50_pct_5d, ... },
+  //     macro: { usd_inr: {value}, india_vix, us_10y_yield, xlk_trend, igv_trend },
+  //     heatmap: [{ symbol, change_pct_1d, change_pct_5d, change_pct_20d, ... }] }
+  const summary = health?.summary ?? {}
+  const macroRaw = health?.macro ?? {}
+  const relPerf = health?.nifty_it_vs_nifty50 ?? {}
   const heatmap = health?.heatmap ?? []
-  const score = health?.thesis_score ?? 0
+  const score = summary.thesis_score ?? health?.thesis_score ?? 0
 
-  // Sort by weakest 20d first (most bearish at top)
-  const sortedHeatmap = [...heatmap].sort((a, b) => (a.change_20d ?? 0) - (b.change_20d ?? 0))
+  // Find NIFTYIT in heatmap to extract spot price
+  const niftyItRow = heatmap.find(s => s.symbol === 'NIFTYIT')
+  const niftyItSpot = niftyItRow?.price
+
+  // Flatten macro for cards
+  const macro = {
+    nifty_it_spot: niftyItSpot,
+    india_vix: macroRaw.india_vix,
+    usdinr: macroRaw.usd_inr?.value ?? macroRaw.usd_inr,
+    us_10y: macroRaw.us_10y_yield,
+    xlk_trend: macroRaw.xlk_trend,
+  }
+
+  // Returns for both indices
+  const niftyItReturns = {
+    ret_5d: relPerf.nifty_it_pct_5d,
+    ret_20d: relPerf.nifty_it_pct_20d,
+    ret_90d: relPerf.nifty_it_pct_90d,
+  }
+  const nifty50Returns = {
+    ret_5d: relPerf.nifty50_pct_5d,
+    ret_20d: relPerf.nifty50_pct_20d,
+    ret_90d: relPerf.nifty50_pct_90d,
+  }
+  const relativeStrength = relPerf.relative_strength
+
+  // Sort by weakest 20d first (most bearish at top) — use change_pct_20d
+  const sortedHeatmap = [...heatmap].sort(
+    (a, b) => (a.change_pct_20d ?? 0) - (b.change_pct_20d ?? 0)
+  )
 
   return (
     <div>
@@ -264,8 +298,8 @@ export default function SectorDashboard() {
                   value={macro.xlk_trend ?? '—'}
                   sub="US Tech ETF"
                   valueClass={
-                    macro.xlk_trend === 'Bearish' ? 'text-red-400'
-                    : macro.xlk_trend === 'Bullish' ? 'text-emerald-400'
+                    /bear/i.test(macro.xlk_trend ?? '') ? 'text-red-400'
+                    : /bull/i.test(macro.xlk_trend ?? '') ? 'text-emerald-400'
                     : 'text-amber-400'
                   }
                 />
@@ -302,19 +336,34 @@ export default function SectorDashboard() {
                 </div>
               </div>
               {/* Relative strength row */}
-              {health?.relative_strength !== undefined && (
+              {relativeStrength !== undefined && relativeStrength !== null && (
                 <div className="mt-4 pt-4 border-t border-slate-700 flex items-center gap-3">
-                  <span className="text-xs text-slate-500">Relative Strength (IT vs N50):</span>
+                  <span className="text-xs text-slate-500">Relative Strength (IT vs N50, 20d):</span>
                   <span className={`text-sm font-bold tabular-nums ${
-                    (health.relative_strength ?? 0) < 0 ? 'text-red-400' : 'text-emerald-400'
+                    relativeStrength < 0 ? 'text-red-400' : 'text-emerald-400'
                   }`}>
-                    {fmtPct(health.relative_strength, 2)}
+                    {fmtPct(relativeStrength, 2)}
                   </span>
-                  {(health.relative_strength ?? 0) < 0 && (
+                  {relativeStrength < 0 && (
                     <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/20 text-red-300 border border-red-500/30">
                       IT underperforming — thesis supported
                     </span>
                   )}
+                </div>
+              )}
+
+              {/* Key signals from backend summary */}
+              {summary.key_signals?.length > 0 && (
+                <div className="mt-4 pt-4 border-t border-slate-700">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 font-semibold">Key Signals</p>
+                  <ul className="space-y-1">
+                    {summary.key_signals.map((sig, i) => (
+                      <li key={i} className="text-xs text-slate-300 flex items-start gap-2">
+                        <span className="text-red-400 mt-0.5">▸</span>
+                        <span>{sig}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
             </div>

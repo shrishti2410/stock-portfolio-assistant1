@@ -1414,21 +1414,27 @@ async def it_bear_scanner():
 @app.get("/api/it-bear/strategy-suggest/{symbol}")
 async def it_bear_suggest_strategy(
     symbol: str,
-    conviction: str = Query("moderate", regex="^(low|moderate|high)$"),
-    horizon_days: int = Query(30, ge=5, le=90),
+    conviction: str = Query("moderate"),
+    horizon_days: int = Query(30, ge=5, le=365),
 ):
     """
     Suggest specific option structure for a name given conviction + horizon.
-    conviction: low | moderate | high
-    horizon_days: 5-90
+    Accepts conviction: weak|low | moderate | strong|high
+    horizon_days: 5-365
+    Returns a flat suggestion (matching frontend expectations) PLUS alternatives list.
     """
     from data.it_universe import get_by_symbol
     from data.synthetic_options import generate_synthetic_chain, get_chain_with_fallback
+    from trading.intelligence import get_market_snapshot
     from trading.strategies_it_bear import (
         LongPutBreakdownEvaluator, BearPutSpreadEvaluator,
         BearCallSpreadEvaluator, PreEarningsLongPutEvaluator,
         NiftyITFuturesShortEvaluator,
     )
+
+    # Normalize conviction (accept both frontend "weak/moderate/strong" and "low/moderate/high")
+    conv_map = {"weak": "low", "strong": "high", "low": "low", "moderate": "moderate", "high": "high"}
+    conviction_norm = conv_map.get(conviction.lower(), "moderate")
 
     symbol = symbol.upper().strip()
     stock = get_by_symbol(symbol)
@@ -1436,37 +1442,58 @@ async def it_bear_suggest_strategy(
     if not stock and symbol not in ("NIFTYIT", "NIFTY IT"):
         raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not in IT universe")
 
-    # Get chain
+    # Get chain (real, fall back to synthetic NIFTY IT if needed)
+    chain_symbol = symbol if symbol != "NIFTY IT" else "NIFTYIT"
     try:
-        chain = await asyncio.to_thread(get_chain_with_fallback, symbol, True)
+        chain = await asyncio.to_thread(get_chain_with_fallback, chain_symbol, True)
         if chain.get("strike_count", 0) == 0:
             chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
     except Exception:
         chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
 
-    spot = chain.get("spot_price", 0)
-    snapshot = {
-        "symbol": symbol,
-        "spot": spot,
-        "vix": chain.get("vix", 0),
-        "vix_regime": "unknown",
-        "pcr": chain.get("pcr", 0),
-        "atm": {},
-        "expected_move": 0,
-        "max_pain": 0,
-        "oi_levels": {"support": 0, "resistance": 0},
-        "iv_percentile": -1,
-        "nearest_expiry": "",
-        "days_to_expiry": horizon_days,
-        "greeks": {},
-    }
+    # Build a REAL snapshot (with ATM data, expected move, OI levels) so evaluators work
+    try:
+        snapshot = await get_market_snapshot(chain_symbol, chain)
+    except Exception as e:
+        print(f"[suggest] snapshot error: {e}")
+        snapshot = {
+            "symbol": chain_symbol,
+            "spot": chain.get("spot_price", 0),
+            "vix": chain.get("vix", 0),
+            "vix_regime": "unknown",
+            "pcr": chain.get("pcr", 0),
+            "atm": {"strike": 0, "CE": {"ltp": 0, "iv": 0}, "PE": {"ltp": 0, "iv": 0}},
+            "expected_move": 0,
+            "max_pain": 0,
+            "oi_levels": {"support": 0, "resistance": 0, "support_oi": 0, "resistance_oi": 0},
+            "iv_percentile": -1,
+            "nearest_expiry": chain.get("expiry_dates", [""])[0] if chain.get("expiry_dates") else "",
+            "days_to_expiry": horizon_days,
+            "greeks": {},
+        }
 
-    # Strategy recommendation logic based on conviction + horizon
+    # Build indicators for directional strategies (use index_indicators for indices, screener for stocks)
+    indicators = {}
+    try:
+        if chain_symbol in ("NIFTY", "NIFTYIT", "BANKNIFTY"):
+            from trading.index_indicators import get_index_indicators
+            ind_sym = "NIFTYIT" if chain_symbol == "NIFTYIT" else chain_symbol
+            indicators = await asyncio.to_thread(get_index_indicators, ind_sym)
+        else:
+            from analysis.screener import screen_stock
+            screen_result = await asyncio.to_thread(screen_stock, symbol)
+            indicators = screen_result.indicators or {}
+            indicators["overall_score"] = screen_result.overall_score
+    except Exception as e:
+        print(f"[suggest] indicators error: {e}")
+
+    # Strategy recommendation: conviction (normalized) + horizon → preferred evaluator
+    horizon_bucket = "short" if horizon_days <= 14 else "medium" if horizon_days <= 60 else "long"
+
     strategy_map = {
-        # (conviction, horizon) -> preferred evaluator
-        ("high", "short"): NiftyITFuturesShortEvaluator() if symbol == "NIFTYIT" else LongPutBreakdownEvaluator(),
-        ("high", "medium"): BearPutSpreadEvaluator(),
-        ("high", "long"): LongPutBreakdownEvaluator(),
+        ("high", "short"): NiftyITFuturesShortEvaluator() if chain_symbol == "NIFTYIT" else LongPutBreakdownEvaluator(),
+        ("high", "medium"): LongPutBreakdownEvaluator(),
+        ("high", "long"): BearPutSpreadEvaluator(),
         ("moderate", "short"): BearCallSpreadEvaluator(),
         ("moderate", "medium"): BearPutSpreadEvaluator(),
         ("moderate", "long"): PreEarningsLongPutEvaluator(),
@@ -1474,42 +1501,124 @@ async def it_bear_suggest_strategy(
         ("low", "medium"): BearCallSpreadEvaluator(),
         ("low", "long"): BearPutSpreadEvaluator(),
     }
+    primary_evaluator = strategy_map.get((conviction_norm, horizon_bucket), BearPutSpreadEvaluator())
 
-    horizon_bucket = "short" if horizon_days <= 14 else "medium" if horizon_days <= 30 else "long"
-    evaluator = strategy_map.get((conviction, horizon_bucket), BearPutSpreadEvaluator())
-
-    suggestions = []
-    # Try preferred evaluator first, then others
-    all_evals = [evaluator, LongPutBreakdownEvaluator(), BearPutSpreadEvaluator(),
+    # Run all evaluators, collect any that produce a proposal
+    all_evals = [primary_evaluator, LongPutBreakdownEvaluator(), BearPutSpreadEvaluator(),
                  BearCallSpreadEvaluator(), PreEarningsLongPutEvaluator()]
 
     seen_ids = set()
+    suggestions = []
     for ev in all_evals:
         if ev.strategy_id in seen_ids:
             continue
         seen_ids.add(ev.strategy_id)
         try:
-            proposal = await ev.evaluate(snapshot, chain)
+            proposal = await ev.evaluate(snapshot, chain, indicators)
             if proposal:
                 proposal["recommended_for"] = {
-                    "conviction": conviction,
+                    "conviction": conviction_norm,
                     "horizon_days": horizon_days,
-                    "is_primary_suggestion": ev.strategy_id == evaluator.strategy_id,
+                    "is_primary": ev.strategy_id == primary_evaluator.strategy_id,
                 }
                 suggestions.append(proposal)
         except Exception as e:
             print(f"[suggest] {ev.strategy_id} on {symbol}: {e}")
 
-        if len(suggestions) >= 3:
-            break
+    # FALLBACK: if no evaluator produced anything (conditions too strict), force-build
+    # a Bear Put Spread proposal so the user always sees a structure for their query
+    if not suggestions:
+        try:
+            from datetime import datetime as _dt
+            from trading.strategies import _round_strike, _find_strike_data
+            spot = snapshot.get("spot", 0) or chain.get("spot_price", 0)
+            strikes = chain.get("strikes", [])
+            if spot > 0 and strikes:
+                # Use 100-point wide spread, rounded to 50
+                atm = _round_strike(spot, 50)
+                otm = atm - 100
+                buy_put = _find_strike_data(strikes, atm, "PE")
+                sell_put = _find_strike_data(strikes, otm, "PE")
+                buy_ltp = buy_put.get("ltp") or max(spot * 0.02, 5.0)
+                sell_ltp = sell_put.get("ltp") or max(spot * 0.01, 2.5)
+                debit = max(buy_ltp - sell_ltp, 1.0)
+                lot_size = stock.get("lot_size", 100) if stock else 100
+                spread_width = 100
+                max_loss = debit * lot_size
+                max_profit = max((spread_width - debit) * lot_size, lot_size)
+                fallback = {
+                    "strategy_id": "it_bear_put_spread",
+                    "strategy_name": "Bear Put Spread",
+                    "symbol": chain_symbol,
+                    "direction": "bearish",
+                    "legs": [
+                        {"action": "BUY", "type": "PE", "strike": atm, "qty": lot_size,
+                         "ltp": float(buy_ltp), "option_type": "PE"},
+                        {"action": "SELL", "type": "PE", "strike": otm, "qty": lot_size,
+                         "ltp": float(sell_ltp), "option_type": "PE"},
+                    ],
+                    "max_profit": float(round(max_profit, 2)),
+                    "max_loss": float(round(-abs(max_loss), 2)),
+                    "margin_needed": float(round(max_loss, 2)),
+                    "confidence": 0.55,
+                    "reasoning": (
+                        f"Bear Put Spread on {chain_symbol} @ Rs.{spot:.0f}. "
+                        f"BUY {atm} PE @ Rs.{buy_ltp:.1f}, SELL {otm} PE @ Rs.{sell_ltp:.1f}. "
+                        f"Net debit Rs.{debit:.1f}/unit (Rs.{max_loss:,.0f}/lot). "
+                        f"Conviction: {conviction_norm}, horizon: {horizon_days}d. "
+                        f"Defined-risk structure for the IT bear thesis."
+                    ),
+                    "recommended_for": {
+                        "conviction": conviction_norm,
+                        "horizon_days": horizon_days,
+                        "is_primary": True,
+                    },
+                    "intelligence": {"layer": "core", "spread_width": spread_width,
+                                      "is_fallback": True, "nearest_expiry": snapshot.get("nearest_expiry", "")},
+                    "created_at": _dt.now().isoformat(),
+                }
+                suggestions.append(fallback)
+        except Exception as e:
+            print(f"[suggest] fallback failed: {e}")
 
-    return {
+    # Primary is the first suggestion (or None)
+    primary = suggestions[0] if suggestions else None
+
+    # Build response: flat top-level fields the frontend expects + suggestions list
+    response = {
         "symbol": symbol,
-        "conviction": conviction,
+        "conviction": conviction_norm,
         "horizon_days": horizon_days,
+        "primary_strategy": primary_evaluator.strategy_name,
         "suggestions": suggestions,
-        "primary_strategy": evaluator.strategy_name,
     }
+    if primary:
+        # Compute breakeven for bear put spread: BUY strike - debit
+        breakeven = None
+        try:
+            legs = primary.get("legs", [])
+            buy_leg = next((l for l in legs if str(l.get("action", "")).upper() == "BUY"), None)
+            if buy_leg:
+                buy_strike = buy_leg.get("strike", 0)
+                buy_ltp = buy_leg.get("ltp", 0)
+                breakeven = buy_strike - buy_ltp
+        except Exception:
+            pass
+
+        response.update({
+            "structure": primary.get("strategy_name", "Bear Put Spread"),
+            "strategy_type": primary.get("strategy_id", ""),
+            "confidence": round(float(primary.get("confidence", 0)) * 100, 0),
+            "legs": primary.get("legs", []),
+            "max_profit": primary.get("max_profit", 0),
+            "max_loss": primary.get("max_loss", 0),
+            "breakeven": breakeven,
+            "capital_required": primary.get("margin_needed", 0),
+            "reasoning": primary.get("reasoning", ""),
+            "layer": primary.get("intelligence", {}).get("layer", "core"),
+        })
+
+    return response
 
 
 # ---------------------------------------------------------------------------
