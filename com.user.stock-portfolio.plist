@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent: com.user.stock-portfolio
+  Runs morning_launch.sh on user login (which then asks for confirmation
+  before actually starting the app).
+
+  INSTALL:
+    cp com.user.stock-portfolio.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.user.stock-portfolio.plist
+
+  UNINSTALL:
+    launchctl unload ~/Library/LaunchAgents/com.user.stock-portfolio.plist
+    rm ~/Library/LaunchAgents/com.user.stock-portfolio.plist
+
+  IMPORTANT: After copying, edit the path below to match where this repo
+  lives on YOUR machine. Replace YOUR_REPO_PATH with the absolute path
+  to the repo root.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.stock-portfolio</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>YOUR_REPO_PATH/morning_launch.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/stock-portfolio-launch.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/stock-portfolio-launch.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- KeepAlive=false so it runs once at login, not on a loop -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
