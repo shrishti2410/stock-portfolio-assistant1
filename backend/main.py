@@ -497,6 +497,24 @@ async def startup():
     except Exception as e:
         print(f"[startup] Event sync: {e}")
 
+    # IT-Bear morning refresh: if today's earnings cache is stale, fire a
+    # background refresh so the user has fresh data when they open the UI.
+    # First-of-the-day startup only — no-ops on subsequent restarts.
+    async def _morning_refresh():
+        try:
+            from data.earnings_calendar import (
+                is_cache_fresh_today, refresh_universe_earnings_cache,
+            )
+            if await is_cache_fresh_today():
+                print("[startup] IT-Bear earnings cache fresh — skipping refresh.")
+                return
+            print("[startup] IT-Bear earnings cache stale → refreshing in background...")
+            await refresh_universe_earnings_cache()
+        except Exception as e:
+            print(f"[startup] IT-Bear morning refresh failed: {e}")
+
+    asyncio.create_task(_morning_refresh())
+
 
 @app.post("/api/strategies")
 async def create_strategy_endpoint(body: dict):
@@ -1447,9 +1465,50 @@ async def it_bear_stock_detail(symbol: str):
 
 @app.get("/api/it-bear/earnings")
 async def it_bear_earnings(days_ahead: int = Query(90, ge=1, le=365)):
-    """Upcoming earnings calendar for IT universe."""
+    """Upcoming earnings calendar for IT universe (cached in DB, refreshed daily)."""
     from data.earnings_calendar import get_universe_earnings_calendar
     return await get_universe_earnings_calendar(days_ahead=days_ahead)
+
+
+@app.get("/api/it-bear/earnings/refresh-status")
+async def it_bear_earnings_refresh_status():
+    """Tells the frontend whether today's earnings have been refreshed."""
+    from data.earnings_calendar import get_last_refresh_date, is_cache_fresh_today
+    last = await get_last_refresh_date()
+    fresh = await is_cache_fresh_today()
+    return {
+        "last_refresh_date": last,
+        "is_fresh_today": fresh,
+        "today": __import__("datetime").date.today().isoformat(),
+    }
+
+
+@app.post("/api/it-bear/earnings/refresh")
+async def it_bear_earnings_refresh(force: bool = Query(False)):
+    """
+    Refresh earnings + last 4 quarters for the entire IT universe.
+
+    Called by:
+    - The morning-startup script (~/Documents/My Software/start-stock-portfolio.command)
+    - Manual "Refresh" button in the UI
+
+    If already refreshed today, returns the cached summary unless force=true.
+    Refresh takes ~20-30s (21 stocks × 2 yfinance calls, 8-way concurrency).
+    """
+    from data.earnings_calendar import (
+        is_cache_fresh_today, refresh_universe_earnings_cache,
+        get_last_refresh_date,
+    )
+
+    if not force and await is_cache_fresh_today():
+        return {
+            "status": "skipped",
+            "reason": "Already refreshed today",
+            "last_refresh_date": await get_last_refresh_date(),
+        }
+
+    summary = await refresh_universe_earnings_cache()
+    return {"status": "refreshed", **summary}
 
 
 @app.get("/api/it-bear/sector-health")

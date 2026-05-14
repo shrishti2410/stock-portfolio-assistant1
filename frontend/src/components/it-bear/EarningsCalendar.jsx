@@ -178,7 +178,18 @@ export default function EarningsCalendar() {
   const [error, setError] = useState(null)
   const [filter, setFilter] = useState('all')
   const [expanded, setExpanded] = useState(new Set())
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshStatus, setRefreshStatus] = useState(null)  // { last_refresh_date, is_fresh_today }
   const navigate = useNavigate()
+
+  // Backend may return either `date` or `earnings_date`. Normalize to both.
+  function normalizeItem(item) {
+    return {
+      ...item,
+      earnings_date: item.earnings_date ?? item.date,
+      recent_quarters: item.recent_quarters ?? [],
+    }
+  }
 
   const fetchEarnings = useCallback(async () => {
     setLoading(true)
@@ -187,7 +198,8 @@ export default function EarningsCalendar() {
       const res = await fetch(`${API_BASE}/api/it-bear/earnings?days_ahead=90`)
       if (!res.ok) throw new Error(`Server error ${res.status}`)
       const json = await res.json()
-      setData(Array.isArray(json) ? json : json.earnings ?? [])
+      const list = Array.isArray(json) ? json : json.earnings ?? []
+      setData(list.map(normalizeItem))
     } catch (err) {
       setError(err.message)
     } finally {
@@ -195,7 +207,29 @@ export default function EarningsCalendar() {
     }
   }, [])
 
-  useEffect(() => { fetchEarnings() }, [fetchEarnings])
+  const fetchRefreshStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/it-bear/earnings/refresh-status`)
+      if (res.ok) setRefreshStatus(await res.json())
+    } catch { /* ignore */ }
+  }, [])
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true)
+    setError(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/it-bear/earnings/refresh?force=true`, { method: 'POST' })
+      if (!res.ok) throw new Error(`Refresh failed (${res.status})`)
+      await fetchEarnings()
+      await fetchRefreshStatus()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRefreshing(false)
+    }
+  }, [fetchEarnings, fetchRefreshStatus])
+
+  useEffect(() => { fetchEarnings(); fetchRefreshStatus() }, [fetchEarnings, fetchRefreshStatus])
 
   function toggleExpand(symbol) {
     setExpanded(prev => {
@@ -232,19 +266,39 @@ export default function EarningsCalendar() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
 
         {/* Header */}
-        <div className="flex items-start justify-between mb-5">
+        <div className="flex items-start justify-between mb-5 gap-4 flex-wrap">
           <div>
             <h1 className="text-2xl font-black text-white">Earnings Calendar</h1>
             <p className="text-slate-500 text-xs mt-1">
               IT stock earnings — pre-earnings options plays (7-21 day window)
             </p>
+            {refreshStatus && (
+              <p className="text-[10px] mt-1.5">
+                {refreshStatus.is_fresh_today
+                  ? <span className="text-emerald-400">● Fresh — refreshed today ({refreshStatus.last_refresh_date})</span>
+                  : refreshStatus.last_refresh_date
+                  ? <span className="text-amber-400">● Stale — last refresh {refreshStatus.last_refresh_date}</span>
+                  : <span className="text-red-400">● Never refreshed — click Refresh below</span>
+                }
+              </p>
+            )}
           </div>
-          {sweetSpotCount > 0 && (
-            <div className="shrink-0 px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-center">
-              <p className="text-xs font-bold text-amber-300">{sweetSpotCount}</p>
-              <p className="text-[10px] text-amber-400">Sweet Spot</p>
-            </div>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border bg-blue-500/15 border-blue-500/30 text-blue-300 hover:bg-blue-500/25 disabled:opacity-50 transition-colors"
+              title="Force-refresh earnings + quarterly data from yfinance (~25s)"
+            >
+              {refreshing ? 'Refreshing… (~25s)' : '↻ Refresh now'}
+            </button>
+            {sweetSpotCount > 0 && (
+              <div className="shrink-0 px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-center">
+                <p className="text-xs font-bold text-amber-300">{sweetSpotCount}</p>
+                <p className="text-[10px] text-amber-400">Sweet Spot</p>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Filter tabs */}
