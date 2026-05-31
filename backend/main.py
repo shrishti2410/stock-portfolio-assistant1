@@ -515,6 +515,20 @@ async def startup():
 
     asyncio.create_task(_morning_refresh())
 
+    # Telegram long-poll listener — only starts if TELEGRAM_BOT_TOKEN is set
+    async def _start_telegram():
+        try:
+            from notifications.telegram_listener import start_listener, _is_configured
+            if _is_configured():
+                result = await start_listener()
+                print(f"[startup] Telegram listener: {result}")
+            else:
+                print("[startup] Telegram listener: not configured (TELEGRAM_BOT_TOKEN missing)")
+        except Exception as e:
+            print(f"[startup] Telegram listener failed to start: {e}")
+
+    asyncio.create_task(_start_telegram())
+
 
 @app.post("/api/strategies")
 async def create_strategy_endpoint(body: dict):
@@ -1912,6 +1926,125 @@ async def test_notification(channel: str):
         "results": results,
         "any_success": any(results.values()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Telegram setup + listener control
+# ---------------------------------------------------------------------------
+
+@app.post("/api/notifications/telegram/setup")
+async def telegram_setup(body: dict):
+    """
+    One-step Telegram setup. Body: { "bot_token": "1234:abc..." }
+
+    Persists the token to .env, optionally captures a chat_id from any
+    pending /start messages, then starts the long-polling listener.
+    The user can then send /start to their bot — the listener will
+    auto-save TELEGRAM_CHAT_ID and reply with a welcome message.
+    """
+    from zerodha.auth import _write_env_key
+    from notifications.telegram_listener import start_listener, stop_listener
+    import httpx
+
+    token = (body.get("bot_token") or "").strip()
+    if not token or ":" not in token:
+        raise HTTPException(
+            status_code=400,
+            detail="bot_token is required (looks like '1234567890:AAabcde...')"
+        )
+
+    # Validate by calling getMe
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+            data = resp.json()
+            if not data.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid bot token: {data.get('description', 'rejected by Telegram')}"
+                )
+            bot_info = data["result"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to validate token: {e}")
+
+    # Save token
+    _write_env_key("TELEGRAM_BOT_TOKEN", token)
+    os.environ["TELEGRAM_BOT_TOKEN"] = token
+
+    # Try to capture chat_id from existing /start updates (idempotent)
+    chat_id_captured = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            updates_resp = await client.get(f"https://api.telegram.org/bot{token}/getUpdates")
+            updates = updates_resp.json().get("result", [])
+        for upd in updates:
+            msg = upd.get("message", {})
+            if msg.get("text", "").startswith("/start"):
+                cid = msg.get("chat", {}).get("id")
+                if cid:
+                    chat_id_captured = cid
+                    _write_env_key("TELEGRAM_CHAT_ID", str(cid))
+                    os.environ["TELEGRAM_CHAT_ID"] = str(cid)
+                    break
+    except Exception as e:
+        print(f"[telegram_setup] chat_id capture skipped: {e}")
+
+    # Restart listener with new token
+    await stop_listener()
+    listener_result = await start_listener()
+
+    return {
+        "status": "configured",
+        "bot": {
+            "username": bot_info.get("username"),
+            "name": bot_info.get("first_name"),
+        },
+        "chat_id_captured": chat_id_captured,
+        "listener": listener_result,
+        "next_step": (
+            "Send /start to your bot in Telegram. The listener will auto-save your chat_id."
+            if not chat_id_captured
+            else "✅ All set — send /add TCS INFY AAPL to your bot."
+        ),
+    }
+
+
+@app.get("/api/notifications/telegram/status")
+async def telegram_status():
+    """Show whether token + chat_id are set + listener state."""
+    from notifications.telegram_listener import is_listening
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    return {
+        "token_set": bool(token),
+        "token_preview": (token[:10] + "..." + token[-4:]) if token else "",
+        "chat_id_set": bool(chat_id),
+        "chat_id": chat_id,
+        "listener_running": is_listening(),
+    }
+
+
+@app.post("/api/notifications/telegram/listener/{action}")
+async def telegram_listener_control(action: str):
+    """action: start | stop | restart"""
+    from notifications.telegram_listener import start_listener, stop_listener
+    if action == "start":
+        return await start_listener()
+    if action == "stop":
+        return await stop_listener()
+    if action == "restart":
+        await stop_listener()
+        return await start_listener()
+    raise HTTPException(status_code=400, detail="action must be: start | stop | restart")
+
+
+@app.get("/api/telegram/watchlist")
+async def telegram_watchlist():
+    """Return all stocks added to the watchlist via Telegram."""
+    from notifications.telegram_listener import _get_watchlist
+    return await _get_watchlist()
 
 
 # ---------------------------------------------------------------------------
