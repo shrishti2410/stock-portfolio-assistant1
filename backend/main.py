@@ -2048,6 +2048,86 @@ async def telegram_watchlist():
 
 
 # ---------------------------------------------------------------------------
+# LLM Gateway — cost observability + budget control
+# ---------------------------------------------------------------------------
+
+@app.get("/api/llm/usage")
+async def llm_usage():
+    """Token/cost observability: spend today/month, limits, by-feature, recent calls."""
+    from llm.gateway import usage_summary
+    return await usage_summary()
+
+
+@app.get("/api/llm/config")
+async def llm_get_config():
+    """Current LLM limits + provider/model config."""
+    from llm.gateway import get_config
+    return await get_config()
+
+
+@app.put("/api/llm/config")
+async def llm_update_config(body: dict):
+    """Update LLM limits (daily/monthly USD caps, per-call tokens, rate, provider, model)."""
+    from llm.gateway import update_config
+    return await update_config(body)
+
+
+@app.post("/api/llm/test")
+async def llm_test(body: dict = None):
+    """
+    Fire a tiny test completion to verify the provider + key work.
+    Counts against the budget (it's a real call) but capped to ~30 tokens.
+    """
+    from llm.gateway import complete, LLMError
+    body = body or {}
+    try:
+        res = await complete(
+            body.get("prompt", "Reply with exactly: LLM gateway OK"),
+            feature="gateway_test",
+            max_tokens=30,
+            allow_cache=False,
+        )
+        return {"status": "ok", **res.to_dict()}
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail={"status": e.status, "message": str(e)})
+
+
+@app.get("/api/llm/providers")
+async def llm_providers():
+    """Which provider API keys are configured (for the Settings UI)."""
+    return {
+        "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+        "openai": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "groq": bool(os.getenv("GROQ_API_KEY", "").strip()),
+        "gemini": bool(os.getenv("GOOGLE_API_KEY", "").strip()),
+    }
+
+
+@app.post("/api/llm/provider-key")
+async def llm_set_provider_key(body: dict):
+    """
+    Save a provider API key to .env (so the user can paste their Claude/OpenAI key
+    from the UI). body: { provider: 'anthropic'|'openai'|'groq'|'gemini', api_key: '...' }
+    """
+    from zerodha.auth import _write_env_key
+    provider = (body.get("provider") or "").lower()
+    api_key = (body.get("api_key") or "").strip()
+    env_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "gemini": "GOOGLE_API_KEY",
+    }
+    if provider not in env_map:
+        raise HTTPException(status_code=400, detail="provider must be anthropic|openai|groq|gemini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    _write_env_key(env_map[provider], api_key)
+    os.environ[env_map[provider]] = api_key
+    return {"status": "saved", "provider": provider, "env_var": env_map[provider]}
+
+
+# ---------------------------------------------------------------------------
 # WebSocket for trading notifications
 # ---------------------------------------------------------------------------
 

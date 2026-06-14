@@ -68,3 +68,6 @@ pytz>=2025.2
 scipy
 apscheduler
 pyotp
+
+# OpenAI (optional LLM provider for strategy chat)
+openai

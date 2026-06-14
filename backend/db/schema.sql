@@ -246,3 +246,87 @@ CREATE TABLE IF NOT EXISTS notification_log (
 
 CREATE INDEX IF NOT EXISTS idx_notification_log_sent ON notification_log(sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_log_channel ON notification_log(channel, success);
+
+-- ============================================================
+-- LLM GATEWAY — cost observability + hard budget limits
+-- ============================================================
+
+-- Single-row config (id=1). All LLM calls obey these limits.
+CREATE TABLE IF NOT EXISTS llm_config (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled             INTEGER DEFAULT 1,        -- master switch for all LLM features
+    provider            TEXT    DEFAULT 'anthropic',  -- anthropic | openai | groq | gemini
+    default_model       TEXT    DEFAULT 'claude-haiku-4-5-20251001',  -- cheapest capable by default
+    daily_limit_usd     REAL    DEFAULT 1.0,      -- hard daily spend cap
+    monthly_limit_usd   REAL    DEFAULT 10.0,     -- hard monthly spend cap
+    per_call_max_tokens INTEGER DEFAULT 1500,     -- max output tokens per call
+    calls_per_min       INTEGER DEFAULT 12,       -- rate limit
+    cache_enabled       INTEGER DEFAULT 1,        -- response caching to avoid dup spend
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO llm_config (id) VALUES (1);
+
+-- Every LLM call (or blocked attempt) is logged here for observability.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    feature       TEXT,                  -- 'strategy_chat' | 'rule_parse' | 'analysis' | ...
+    provider      TEXT,
+    model         TEXT,
+    input_tokens  INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd      REAL    DEFAULT 0,
+    cached        INTEGER DEFAULT 0,     -- 1 if served from cache (cost 0)
+    latency_ms    INTEGER,
+    status        TEXT    DEFAULT 'ok',  -- ok | budget_blocked | rate_limited | disabled | error
+    error         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_feature ON llm_usage(feature);
+
+-- Response cache (avoids paying twice for identical prompts).
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key   TEXT PRIMARY KEY,        -- sha256(provider|model|system|prompt|max_tokens)
+    response    TEXT,
+    model       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- UNIFIED STRATEGIES (Phase B marketplace)
+-- ============================================================
+
+-- One row per strategy, regardless of source (predefined / custom / it-bear / llm-authored).
+CREATE TABLE IF NOT EXISTS strategy_defs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug            TEXT UNIQUE,             -- stable id, e.g. 'iron_condor' or 'custom_17'
+    name            TEXT NOT NULL,
+    source          TEXT NOT NULL,           -- 'predefined' | 'it_bear' | 'custom' | 'llm'
+    category        TEXT,                    -- 'options' | 'directional' | 'commodity' | 'event' | ...
+    market          TEXT DEFAULT 'IN',       -- 'IN' | 'US' | 'BOTH'
+    direction       TEXT,                    -- 'bullish' | 'bearish' | 'neutral' | 'any'
+    description     TEXT,
+    entry_conditions TEXT DEFAULT '[]',      -- JSON array of {indicator, operator, value, note}
+    exit_conditions  TEXT DEFAULT '[]',      -- JSON array
+    legs            TEXT DEFAULT '[]',       -- JSON array of option legs (if applicable)
+    config          TEXT DEFAULT '{}',       -- JSON: tunable params (thresholds, sizing, time windows)
+    risk            TEXT,                    -- 'low' | 'medium' | 'high'
+    tags            TEXT DEFAULT '[]',       -- JSON array
+    is_editable     INTEGER DEFAULT 1,       -- predefined originals are read-only (fork to edit)
+    forked_from     TEXT,                    -- slug of parent if forked
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_defs_source ON strategy_defs(source);
+CREATE INDEX IF NOT EXISTS idx_strategy_defs_category ON strategy_defs(category);
+
+-- Chat history for LLM-assisted strategy authoring (per draft session).
+CREATE TABLE IF NOT EXISTS strategy_chats (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,               -- groups messages of one authoring session
+    role        TEXT NOT NULL,               -- 'user' | 'assistant'
+    content     TEXT NOT NULL,
+    draft       TEXT,                        -- JSON snapshot of the strategy draft after this turn
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_chats_session ON strategy_chats(session_id, created_at);

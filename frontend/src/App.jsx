@@ -23,6 +23,7 @@ import StrategiesHub from './pages/StrategiesHub'
 import Backtest from './pages/Backtest'
 import MarketsHub from './pages/MarketsHub'
 import SettingsHub from './pages/SettingsHub'
+import LLMSettings from './pages/LLMSettings'
 
 // IT-Bear components
 import {
@@ -73,8 +74,9 @@ export default function App() {
           <Route path="/options" element={<OptionChain />} />
           <Route path="/mcx" element={<MCXCommodities />} />
 
-          {/* ── Settings (Notifications + Glossary) ── */}
+          {/* ── Settings (Notifications + Glossary + LLM) ── */}
           <Route path="/settings" element={<SettingsHub />} />
+          <Route path="/settings/llm" element={<LLMSettings />} />
           <Route path="/glossary" element={<IndicatorGlossary />} />
 
           {/* ── IT-Bear thesis ── */}

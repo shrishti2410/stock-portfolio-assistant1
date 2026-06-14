@@ -29,6 +29,14 @@ export default function SettingsHub() {
           tone="emerald"
         />
         <HubCard
+          to="/settings/llm"
+          icon={IconSettings}
+          title="LLM Cost Control"
+          description="Set hard daily/monthly spend caps, paste your Claude/OpenAI key, and watch token usage + cost per feature live."
+          tone="amber"
+          badge="cost control"
+        />
+        <HubCard
           to="/glossary"
           icon={IconStrategy}
           title="Indicator Glossary"
