@@ -24,6 +24,9 @@ import Backtest from './pages/Backtest'
 import MarketsHub from './pages/MarketsHub'
 import SettingsHub from './pages/SettingsHub'
 import LLMSettings from './pages/LLMSettings'
+import Marketplace from './pages/Marketplace'
+import StrategyDetail from './pages/StrategyDetail'
+import StrategyChat from './pages/StrategyChat'
 
 // IT-Bear components
 import {
@@ -49,6 +52,9 @@ export default function App() {
           <Route path="/history" element={<AnalysisHistory />} />
 
           {/* ── Strategies ── */}
+          <Route path="/marketplace" element={<Marketplace />} />
+          <Route path="/marketplace/chat" element={<StrategyChat />} />
+          <Route path="/marketplace/:slug" element={<StrategyDetail />} />
           <Route path="/strategies" element={<StrategiesHub />} />
           <Route path="/strategies/custom" element={<StrategyList />} />
           <Route path="/strategies/new" element={<StrategyBuilder />} />

@@ -330,3 +330,70 @@ CREATE TABLE IF NOT EXISTS strategy_chats (
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_chats_session ON strategy_chats(session_id, created_at);
+
+-- ============================================================
+-- HISTORICAL DATA STORE (Phase C — our own local bars database)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS hist_bars (
+    symbol    TEXT NOT NULL,        -- 'NIFTY', 'BANKNIFTY', 'GC=F', 'AAPL', '^INDIAVIX', …
+    timeframe TEXT NOT NULL,        -- '1m' | '5m' | '15m' | '1d'
+    ts        TEXT NOT NULL,        -- UTC ISO datetime
+    open REAL, high REAL, low REAL, close REAL,
+    volume    REAL DEFAULT 0,
+    oi        REAL,
+    source    TEXT,                 -- 'yfinance' | 'dhan' | 'alpaca' | 'jugaad'
+    PRIMARY KEY (symbol, timeframe, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_hist_bars_lookup ON hist_bars(symbol, timeframe, ts);
+
+-- Coverage metadata (what we hold locally, per symbol+timeframe)
+CREATE TABLE IF NOT EXISTS hist_meta (
+    symbol     TEXT NOT NULL,
+    timeframe  TEXT NOT NULL,
+    first_ts   TEXT,
+    last_ts    TEXT,
+    bar_count  INTEGER DEFAULT 0,
+    source     TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, timeframe)
+);
+
+-- ============================================================
+-- BACKTESTING (Phase C/D)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_slug  TEXT NOT NULL,
+    config         TEXT DEFAULT '{}',     -- JSON config used (after overrides)
+    universe       TEXT DEFAULT '[]',     -- JSON list of symbols
+    timeframe      TEXT DEFAULT '5m',
+    start_date     TEXT,
+    end_date       TEXT,
+    initial_capital REAL DEFAULT 100000,
+    status         TEXT DEFAULT 'running', -- running | done | error
+    metrics        TEXT,                  -- JSON summary metrics
+    equity_curve   TEXT,                  -- JSON [[ts, equity], ...]
+    error          TEXT,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at    TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_created ON backtest_runs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER REFERENCES backtest_runs(id) ON DELETE CASCADE,
+    symbol      TEXT,
+    direction   TEXT,          -- long | short | long_ce | long_pe
+    entry_ts    TEXT,
+    entry_price REAL,
+    exit_ts     TEXT,
+    exit_price  REAL,
+    qty         REAL,
+    pnl         REAL,
+    pnl_pct     REAL,
+    exit_reason TEXT,          -- target | stop | time | signal
+    meta        TEXT           -- JSON extras (strike, synthetic spread, day trend, …)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id);

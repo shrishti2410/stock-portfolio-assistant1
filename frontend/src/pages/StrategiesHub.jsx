@@ -1,9 +1,9 @@
 /**
  * StrategiesHub — landing for the Strategies section.
- * Phase A: routes to the 3 existing strategy systems + previews the unified
- * marketplace coming in Phase B.
+ * Routes to the unified Strategy Marketplace plus the 3 existing strategy systems.
  */
-import { PageHeader, Card } from '../ui'
+import { Link } from 'react-router-dom'
+import { PageHeader } from '../ui'
 import { IconStrategy, IconLayers, IconBear, IconBacktest } from '../ui/icons'
 import { HubCard } from './HubCard'
 
@@ -17,15 +17,22 @@ export default function StrategiesHub() {
       />
 
       <div className="bg-brand-soft border border-brand/20 rounded-xl p-4 mb-6">
-        <p className="text-sm font-semibold text-ink">Unified strategy marketplace — coming in Phase B</p>
-        <p className="text-xs text-ink-muted mt-1 leading-relaxed">
-          Soon: one place to browse all strategies, fork &amp; edit their trigger conditions in plain
-          English, and author brand-new ones by chatting with an LLM. For now, the three existing
-          systems are linked below.
+        <p className="text-sm text-ink">
+          <span className="font-semibold">New:</span> the unified{' '}
+          <Link to="/marketplace" className="text-brand font-semibold hover:underline">Strategy Marketplace</Link>{' '}
+          is live — every strategy in one place, forkable and editable.
         </p>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <HubCard
+          to="/marketplace"
+          icon={IconLayers}
+          title="Strategy Marketplace"
+          description="All strategies in one place — browse, fork, edit triggers, author new ones with AI."
+          tone="brand"
+          badge="NEW"
+        />
         <HubCard
           to="/fo-strategies"
           icon={IconLayers}

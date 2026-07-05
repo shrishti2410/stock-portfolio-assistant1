@@ -55,6 +55,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Feature routers (Phase B/C: marketplace, chat authoring, data, backtest) ──
+from routers.marketplace import router as marketplace_router
+from routers.marketplace_chat import router as marketplace_chat_router
+from routers.data_api import router as data_router
+from routers.backtest_api import router as backtest_router
+
+app.include_router(marketplace_router)
+app.include_router(marketplace_chat_router)
+app.include_router(data_router)
+app.include_router(backtest_router)
+
 
 # ---------------------------------------------------------------------------
 # Rule-based analysis (no external API calls)
@@ -514,6 +525,14 @@ async def startup():
             print(f"[startup] IT-Bear morning refresh failed: {e}")
 
     asyncio.create_task(_morning_refresh())
+
+    # Seed the unified strategy marketplace (idempotent — skips existing slugs)
+    try:
+        from marketplace.seeds import seed_all
+        result = await seed_all()
+        print(f"[startup] Marketplace seed: {result}")
+    except Exception as e:
+        print(f"[startup] Marketplace seed failed: {e}")
 
     # Telegram long-poll listener — only starts if TELEGRAM_BOT_TOKEN is set
     async def _start_telegram():
