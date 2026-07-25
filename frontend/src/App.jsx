@@ -1,5 +1,10 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AppShell } from './shell/AppShell'
+import { AuthProvider, useAuth } from './shell/useAuth'
+import { LoadingSpinner } from './ui'
+
+// Auth
+import Login from './pages/Login'
 
 // Existing feature components (unchanged — reachable inside the new shell)
 import Dashboard from './components/Dashboard'
@@ -27,6 +32,8 @@ import LLMSettings from './pages/LLMSettings'
 import Marketplace from './pages/Marketplace'
 import StrategyDetail from './pages/StrategyDetail'
 import StrategyChat from './pages/StrategyChat'
+import BrokerSettings from './pages/BrokerSettings'
+import UsersAdmin from './pages/UsersAdmin'
 
 // IT-Bear components
 import {
@@ -40,63 +47,98 @@ import {
   USSignals,
 } from './components/it-bear'
 
+/** Gate for everything except /login: waits for the session check, then
+ *  either renders the app shell or bounces to /login. */
+function RequireAuth({ children }) {
+  const { user, loading } = useAuth()
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-app">
+        <LoadingSpinner message="Loading your session…" />
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />
+  }
+
+  return children
+}
+
 export default function App() {
   return (
-    <BrowserRouter>
-      <AppShell>
+    <AuthProvider>
+      <BrowserRouter>
         <Routes>
-          {/* ── Portfolio (was Dashboard + History) ── */}
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/portfolio" element={<Dashboard />} />
-          <Route path="/stock/:symbol" element={<StockAnalysis />} />
-          <Route path="/history" element={<AnalysisHistory />} />
+          <Route path="/login" element={<Login />} />
 
-          {/* ── Strategies ── */}
-          <Route path="/marketplace" element={<Marketplace />} />
-          <Route path="/marketplace/chat" element={<StrategyChat />} />
-          <Route path="/marketplace/:slug" element={<StrategyDetail />} />
-          <Route path="/strategies" element={<StrategiesHub />} />
-          <Route path="/strategies/custom" element={<StrategyList />} />
-          <Route path="/strategies/new" element={<StrategyBuilder />} />
-          <Route path="/strategies/:id" element={<StrategyBuilder />} />
-          <Route path="/fo-strategies" element={<PredefinedStrategies />} />
+          <Route
+            path="/*"
+            element={
+              <RequireAuth>
+                <AppShell>
+                  <Routes>
+                    {/* ── Portfolio (was Dashboard + History) ── */}
+                    <Route path="/" element={<Dashboard />} />
+                    <Route path="/portfolio" element={<Dashboard />} />
+                    <Route path="/stock/:symbol" element={<StockAnalysis />} />
+                    <Route path="/history" element={<AnalysisHistory />} />
 
-          {/* ── Backtest (Phase C) ── */}
-          <Route path="/backtest" element={<Backtest />} />
+                    {/* ── Strategies ── */}
+                    <Route path="/marketplace" element={<Marketplace />} />
+                    <Route path="/marketplace/chat" element={<StrategyChat />} />
+                    <Route path="/marketplace/:slug" element={<StrategyDetail />} />
+                    <Route path="/strategies" element={<StrategiesHub />} />
+                    <Route path="/strategies/custom" element={<StrategyList />} />
+                    <Route path="/strategies/new" element={<StrategyBuilder />} />
+                    <Route path="/strategies/:id" element={<StrategyBuilder />} />
+                    <Route path="/fo-strategies" element={<PredefinedStrategies />} />
 
-          {/* ── Trading ── */}
-          <Route path="/trading" element={<TradingDashboard />} />
-          <Route path="/trading/approve/:id" element={<TradeApproval />} />
-          <Route path="/trading/settings" element={<TradingSettings />} />
-          <Route path="/trading/history" element={<TradeHistory />} />
-          <Route path="/trading/positions" element={<PositionMonitor />} />
+                    {/* ── Backtest (Phase C) ── */}
+                    <Route path="/backtest" element={<Backtest />} />
 
-          {/* ── Signals (was Alerts) ── */}
-          <Route path="/signals" element={<AlertsPanel />} />
-          <Route path="/alerts" element={<AlertsPanel />} />
+                    {/* ── Trading ── */}
+                    <Route path="/trading" element={<TradingDashboard />} />
+                    <Route path="/trading/approve/:id" element={<TradeApproval />} />
+                    <Route path="/trading/settings" element={<TradingSettings />} />
+                    <Route path="/trading/history" element={<TradeHistory />} />
+                    <Route path="/trading/positions" element={<PositionMonitor />} />
 
-          {/* ── Markets (Options + MCX + Earnings) ── */}
-          <Route path="/markets" element={<MarketsHub />} />
-          <Route path="/options" element={<OptionChain />} />
-          <Route path="/mcx" element={<MCXCommodities />} />
+                    {/* ── Signals (was Alerts) ── */}
+                    <Route path="/signals" element={<AlertsPanel />} />
+                    <Route path="/alerts" element={<AlertsPanel />} />
 
-          {/* ── Settings (Notifications + Glossary + LLM) ── */}
-          <Route path="/settings" element={<SettingsHub />} />
-          <Route path="/settings/llm" element={<LLMSettings />} />
-          <Route path="/glossary" element={<IndicatorGlossary />} />
+                    {/* ── Markets (Options + MCX + Earnings) ── */}
+                    <Route path="/markets" element={<MarketsHub />} />
+                    <Route path="/options" element={<OptionChain />} />
+                    <Route path="/mcx" element={<MCXCommodities />} />
 
-          {/* ── IT-Bear thesis ── */}
-          <Route path="/it-bear" element={<SectorDashboard />} />
-          <Route path="/it-bear/earnings" element={<EarningsCalendar />} />
-          <Route path="/it-bear/universe" element={<ITUniverse />} />
-          <Route path="/it-bear/stock/:symbol" element={<ITStockDetail />} />
-          <Route path="/it-bear/strategy-builder" element={<ITStrategyBuilder />} />
-          <Route path="/it-bear/strategy-builder/:symbol" element={<ITStrategyBuilder />} />
-          <Route path="/it-bear/scanner" element={<Scanner />} />
-          <Route path="/it-bear/notifications" element={<NotificationSettings />} />
-          <Route path="/it-bear/us-signals" element={<USSignals />} />
+                    {/* ── Settings (Notifications + Glossary + LLM + Broker + Users) ── */}
+                    <Route path="/settings" element={<SettingsHub />} />
+                    <Route path="/settings/broker" element={<BrokerSettings />} />
+                    <Route path="/settings/users" element={<UsersAdmin />} />
+                    <Route path="/settings/llm" element={<LLMSettings />} />
+                    <Route path="/glossary" element={<IndicatorGlossary />} />
+
+                    {/* ── IT-Bear thesis ── */}
+                    <Route path="/it-bear" element={<SectorDashboard />} />
+                    <Route path="/it-bear/earnings" element={<EarningsCalendar />} />
+                    <Route path="/it-bear/universe" element={<ITUniverse />} />
+                    <Route path="/it-bear/stock/:symbol" element={<ITStockDetail />} />
+                    <Route path="/it-bear/strategy-builder" element={<ITStrategyBuilder />} />
+                    <Route path="/it-bear/strategy-builder/:symbol" element={<ITStrategyBuilder />} />
+                    <Route path="/it-bear/scanner" element={<Scanner />} />
+                    <Route path="/it-bear/notifications" element={<NotificationSettings />} />
+                    <Route path="/it-bear/us-signals" element={<USSignals />} />
+                  </Routes>
+                </AppShell>
+              </RequireAuth>
+            }
+          />
         </Routes>
-      </AppShell>
-    </BrowserRouter>
+      </BrowserRouter>
+    </AuthProvider>
   )
 }

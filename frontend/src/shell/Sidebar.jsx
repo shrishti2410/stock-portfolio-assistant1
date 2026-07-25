@@ -6,10 +6,11 @@ import { useState, useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
   IconPortfolio, IconStrategy, IconBacktest, IconTrading, IconSignal,
-  IconBear, IconMarkets, IconSettings, IconSun, IconMoon,
+  IconBear, IconMarkets, IconSettings, IconSun, IconMoon, IconLogout,
 } from '../ui/icons'
+import { useAuth } from './useAuth'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const SECTIONS = [
   {
@@ -82,6 +83,40 @@ function NavItem({ item, engineRunning, onNavigate }) {
   )
 }
 
+function UserBlock() {
+  const { user, logout } = useAuth()
+  if (!user) return null
+
+  const initial = (user.display_name || user.username || '?').charAt(0).toUpperCase()
+
+  return (
+    <div className="px-4 py-3 border-b border-white/5 flex items-center gap-2.5">
+      <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center shrink-0">
+        <span className="text-xs font-bold text-slate-200">{initial}</span>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <p className="text-xs font-semibold text-slate-100 truncate">{user.display_name || user.username}</p>
+          {user.is_admin && (
+            <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded-full bg-brand/20 text-blue-300 font-semibold">
+              Admin
+            </span>
+          )}
+        </div>
+        <p className="text-[10px] text-slate-500 truncate">@{user.username}</p>
+      </div>
+      <button
+        onClick={logout}
+        title="Log out"
+        aria-label="Log out"
+        className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-colors shrink-0"
+      >
+        <IconLogout className="w-4 h-4" />
+      </button>
+    </div>
+  )
+}
+
 export function Sidebar({ theme, onToggleTheme, mobileOpen, onClose }) {
   const engineRunning = useEngineStatus()
 
@@ -110,6 +145,8 @@ export function Sidebar({ theme, onToggleTheme, mobileOpen, onClose }) {
             </div>
           </div>
         </div>
+
+        <UserBlock />
 
         {/* Nav sections */}
         <nav className="flex-1 overflow-y-auto px-2.5 py-3 space-y-5">

@@ -12,10 +12,16 @@ GET  /api/analysis/ai/{symbol}          → multi-agent AI analysis (slow, 600s 
 GET  /api/analyze/{symbol}              → full analysis for any stock (screening + AI)
 GET  /api/search/stocks?q=              → autocomplete symbol search
 DEL  /api/analysis/cache                → clear AI cache
-GET  /api/auth/login                    → returns Zerodha login URL
-GET  /api/auth/callback?request_token=  → exchanges token, saves to .env
-GET  /api/auth/status                   → check if Zerodha connected
-DEL  /api/auth/logout                   → clears Zerodha token
+GET  /api/zerodha/login                 → returns Zerodha login URL
+GET  /api/zerodha/callback?request_token= → exchanges token, saves to .env
+GET  /api/zerodha/status                → check if Zerodha connected
+DEL  /api/zerodha/logout                → clears Zerodha token
+POST /api/auth/login                    → multi-user login (sets session cookie)
+POST /api/auth/logout                   → multi-user logout
+GET  /api/auth/me                       → current authenticated user
+                                           (see routers/auth_api.py, routers/broker_api.py
+                                            for the full multi-user auth + per-user
+                                            broker credential API)
 POST /api/strategies                    → create strategy from natural language
 GET  /api/strategies                    → list all strategies
 GET  /api/strategies/{id}               → strategy detail with rules
@@ -29,15 +35,19 @@ PUT  /api/alerts/{id}/read              → mark alert as read
 
 import asyncio
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from zerodha.client import get_holdings
+from zerodha.client import get_holdings, get_holdings_for_user
 from zerodha.auth import get_login_url, exchange_token
 from analysis.analyzer import analyze_stock_ai, _ai_cache
+from auth.service import get_session_user
+from auth.seed import ensure_admin
 
 load_dotenv()
 
@@ -47,6 +57,56 @@ load_dotenv()
 
 app = FastAPI(title="Stock Portfolio Assistant", version="0.1.0")
 
+# ── Feature routers (Phase B/C/D: marketplace, chat authoring, data, backtest, auth) ──
+from routers.marketplace import router as marketplace_router
+from routers.marketplace_chat import router as marketplace_chat_router
+from routers.data_api import router as data_router
+from routers.backtest_api import router as backtest_router
+from routers.auth_api import router as auth_api_router
+from routers.broker_api import router as broker_api_router
+
+app.include_router(marketplace_router)
+app.include_router(marketplace_chat_router)
+app.include_router(data_router)
+app.include_router(backtest_router)
+app.include_router(auth_api_router)
+app.include_router(broker_api_router)
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware — protects all /api/* routes except a small allowlist.
+# Any path NOT starting with /api/ (static SPA assets, index.html, etc.) is
+# always let through untouched so the login page itself can load.
+# ---------------------------------------------------------------------------
+
+_AUTH_ALLOWLIST_EXACT = {"/health", "/api/auth/login"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # CORS preflight requests never carry cookies and must reach
+    # CORSMiddleware untouched, regardless of auth state.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _AUTH_ALLOWLIST_EXACT or not path.startswith("/api/"):
+        return await call_next(request)
+
+    token = request.cookies.get("session")
+    user = await get_session_user(token) if token else None
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    request.state.user = user
+    return await call_next(request)
+
+
+# NOTE: CORSMiddleware is registered AFTER auth_middleware above so it ends up
+# as the OUTERMOST layer — Starlette wraps middleware in the reverse order
+# they're added (the most-recently-added becomes outermost). This guarantees
+# CORS headers are present even on 401 responses from auth_middleware, and
+# that preflight requests are always handled correctly.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],  # Vite dev server
@@ -54,17 +114,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ── Feature routers (Phase B/C: marketplace, chat authoring, data, backtest) ──
-from routers.marketplace import router as marketplace_router
-from routers.marketplace_chat import router as marketplace_chat_router
-from routers.data_api import router as data_router
-from routers.backtest_api import router as backtest_router
-
-app.include_router(marketplace_router)
-app.include_router(marketplace_chat_router)
-app.include_router(data_router)
-app.include_router(backtest_router)
 
 
 # ---------------------------------------------------------------------------
@@ -182,18 +231,20 @@ async def health_check():
 
 
 @app.get("/api/portfolio")
-async def get_portfolio():
+async def get_portfolio(request: Request):
     """
-    Return the current portfolio holdings.
+    Return the current portfolio holdings for the authenticated user.
 
-    Uses Zerodha Kite Connect when ZERODHA_ACCESS_TOKEN is set,
-    otherwise returns dummy data (see zerodha/client.py).
+    Uses that user's own Zerodha credentials when configured (Settings UI),
+    falls back to legacy env credentials for admins, otherwise dummy data
+    (see zerodha/client.py get_holdings_for_user()).
 
     Response shape (list):
         symbol, quantity, average_price, last_price, pnl, pnl_percentage
     """
+    user = getattr(request.state, "user", None)
     try:
-        holdings = await get_holdings()
+        holdings = await get_holdings_for_user(user)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch holdings: {exc}")
     return holdings
@@ -286,9 +337,10 @@ async def get_analysis(symbol: str):
 
 
 @app.get("/api/dashboard")
-async def get_dashboard():
+async def get_dashboard(request: Request):
     """
-    Return holdings merged with rule-based analysis for every stock.
+    Return holdings merged with rule-based analysis for every stock, for the
+    authenticated user (see get_holdings_for_user() in zerodha/client.py).
 
     Fetches all holdings in one call, then fans out analysis concurrently
     via asyncio.gather so the response time doesn't grow linearly with
@@ -298,10 +350,11 @@ async def get_dashboard():
         symbol, quantity, avg_price, current_price,
         pnl, pnl_pct, recommendation, reasoning, trend, confidence
     """
+    user = getattr(request.state, "user", None)
     try:
-        holdings = await get_holdings()
+        holdings = await get_holdings_for_user(user)
     except Exception:
-        # get_holdings() should never raise (it catches internally),
+        # get_holdings_for_user() should never raise (it catches internally),
         # but if something unexpected slips through, serve dummy data.
         from zerodha.client import _dummy_holdings
         holdings = _dummy_holdings()
@@ -415,7 +468,7 @@ async def analyze_external_stock(symbol: str):
 # Auth routes
 # ---------------------------------------------------------------------------
 
-@app.get("/api/auth/login")
+@app.get("/api/zerodha/login")
 async def auth_login():
     """
     Return the Zerodha login URL so the frontend can open it in a new tab.
@@ -436,7 +489,7 @@ async def auth_login():
     return {"login_url": login_url}
 
 
-@app.get("/api/auth/callback", response_class=HTMLResponse)
+@app.get("/api/zerodha/callback", response_class=HTMLResponse)
 async def auth_callback(
     request_token: str = Query(None),
     action: str = Query(None),
@@ -468,7 +521,7 @@ async def auth_callback(
     return HTMLResponse(_html_page(success=True))
 
 
-@app.get("/api/auth/status")
+@app.get("/api/zerodha/status")
 async def auth_status():
     """
     Return whether a Zerodha access token is configured.
@@ -480,7 +533,7 @@ async def auth_status():
     return {"connected": connected, "source": "zerodha" if connected else "dummy"}
 
 
-@app.delete("/api/auth/logout")
+@app.delete("/api/zerodha/logout")
 async def auth_logout():
     """
     Clear the Zerodha access token from .env and the live process env.
@@ -501,6 +554,14 @@ async def auth_logout():
 async def startup():
     from db.database import init_db
     await init_db()
+
+    # Multi-user auth: ensure a default admin exists (idempotent), and
+    # migrate any legacy .env Zerodha credentials into their user_settings.
+    try:
+        await ensure_admin()
+    except Exception as e:
+        print(f"[startup] ensure_admin failed: {e}")
+
     # Sync market events to DB
     try:
         from trading.events import sync_events_to_db
@@ -2147,13 +2208,90 @@ async def llm_set_provider_key(body: dict):
 
 
 # ---------------------------------------------------------------------------
+# System health (ops/admin) — protected implicitly by auth_middleware since
+# this path starts with /api/.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/system/health")
+async def system_health():
+    """
+    System resource snapshot for the admin dashboard: disk, memory, load
+    average, DB file size, Python version, and server time.
+
+    mem.* fields are None on platforms without /proc/meminfo (e.g. macOS).
+    """
+    import shutil
+    import sys
+    from datetime import datetime, timezone
+
+    # Disk usage (root filesystem)
+    disk_total, _disk_used_ignored, disk_free = shutil.disk_usage("/")
+    disk_used = disk_total - disk_free
+    disk = {
+        "total_gb": round(disk_total / (1024 ** 3), 2),
+        "used_gb": round(disk_used / (1024 ** 3), 2),
+        "pct": round(disk_used / disk_total * 100, 1) if disk_total else None,
+    }
+
+    # Memory — Linux-only via /proc/meminfo; None fields elsewhere (e.g. macOS).
+    mem = {"total_mb": None, "available_mb": None, "pct": None}
+    try:
+        meminfo: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    meminfo[parts[0].strip()] = int(parts[1].strip().split()[0])
+
+        total_kb = meminfo.get("MemTotal")
+        available_kb = meminfo.get("MemAvailable")
+        if total_kb:
+            mem["total_mb"] = round(total_kb / 1024, 1)
+        if available_kb:
+            mem["available_mb"] = round(available_kb / 1024, 1)
+        if total_kb and available_kb:
+            mem["pct"] = round((total_kb - available_kb) / total_kb * 100, 1)
+    except Exception:
+        pass  # /proc/meminfo not available on this platform
+
+    # Load average
+    try:
+        load_avg = list(os.getloadavg())
+    except (OSError, AttributeError):
+        load_avg = None
+
+    # DB file size
+    db_path = Path(__file__).resolve().parent / "data" / "portfolio.db"
+    try:
+        db_size_mb = round(os.path.getsize(db_path) / (1024 ** 2), 2)
+    except OSError:
+        db_size_mb = None
+
+    return {
+        "disk": disk,
+        "mem": mem,
+        "load_avg": load_avg,
+        "db_size_mb": db_size_mb,
+        "python": sys.version.split()[0],
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # WebSocket for trading notifications
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/trading")
 async def trading_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time trading updates."""
+    """WebSocket endpoint for real-time trading updates. Requires a valid session cookie."""
     from trading.engine import trading_engine
+
+    token = websocket.cookies.get("session")
+    user = await get_session_user(token) if token else None
+    if not user:
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
     trading_engine.register_ws(websocket)
 
@@ -2170,3 +2308,45 @@ async def trading_websocket(websocket: WebSocket):
         trading_engine.unregister_ws(websocket)
     except Exception:
         trading_engine.unregister_ws(websocket)
+
+
+# ---------------------------------------------------------------------------
+# SPA static serving — serves the built frontend (frontend/dist), if present.
+#
+# Entirely a no-op in dev before `npm run build` has ever produced a dist/
+# folder: none of the routes below get registered, so nothing about local
+# dev (Vite on :5173 talking to this API on its own port) changes.
+#
+# Must stay at the very end of the file: the catch-all route matches any
+# path, so anything registered after it would be unreachable.
+# ---------------------------------------------------------------------------
+
+_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+if _FRONTEND_DIST.exists():
+    _FRONTEND_ASSETS = _FRONTEND_DIST / "assets"
+    if _FRONTEND_ASSETS.exists():
+        app.mount("/assets", StaticFiles(directory=str(_FRONTEND_ASSETS)), name="assets")
+
+    _FRONTEND_FAVICON = _FRONTEND_DIST / "favicon.svg"
+
+    @app.get("/favicon.svg")
+    async def _spa_favicon():
+        if _FRONTEND_FAVICON.exists():
+            return FileResponse(str(_FRONTEND_FAVICON))
+        raise HTTPException(status_code=404, detail="favicon.svg not found")
+
+    @app.get("/{full_path:path}")
+    async def _spa_catch_all(full_path: str):
+        """Serve index.html for any non-API, non-WS path (client-side routing)."""
+        if full_path.startswith("api/") or full_path == "ws" or full_path.startswith("ws/"):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        index_file = _FRONTEND_DIST / "index.html"
+        if not index_file.exists():
+            raise HTTPException(status_code=404, detail="Frontend build not found")
+        return FileResponse(str(index_file))
+
+    print(f"[main] Serving SPA static build from {_FRONTEND_DIST}")
+else:
+    print(f"[main] Frontend dist not found at {_FRONTEND_DIST} — SPA static serving disabled (dev mode).")

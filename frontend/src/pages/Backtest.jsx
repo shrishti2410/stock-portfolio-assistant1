@@ -12,7 +12,7 @@ import {
 } from '../ui'
 import { IconBacktest } from '../ui/icons'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const QUICK_SYMBOLS = ['^NSEI', '^NSEBANK', 'GC=F', 'SI=F', 'CL=F', 'NG=F']
 const TIMEFRAMES = [

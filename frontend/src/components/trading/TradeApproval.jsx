@@ -9,7 +9,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const AUTO_EXPIRY_SECONDS = 600 // 10 minutes
 

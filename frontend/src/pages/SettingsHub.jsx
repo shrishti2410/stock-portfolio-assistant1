@@ -2,7 +2,7 @@
  * SettingsHub — notifications, Telegram, broker setup, indicator glossary.
  */
 import { PageHeader } from '../ui'
-import { IconBell, IconSettings, IconStrategy } from '../ui/icons'
+import { IconBell, IconSettings, IconStrategy, IconLink, IconUsers } from '../ui/icons'
 import { HubCard } from './HubCard'
 
 export default function SettingsHub() {
@@ -14,6 +14,21 @@ export default function SettingsHub() {
         icon={IconSettings}
       />
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <HubCard
+          to="/settings/broker"
+          icon={IconLink}
+          title="Broker Connection"
+          description="Connect YOUR Zerodha account — per-user, encrypted, editable right here"
+          tone="emerald"
+        />
+        <HubCard
+          to="/settings/users"
+          icon={IconUsers}
+          title="Users"
+          description="Manage logins for this deployment"
+          tone="brand"
+          badge="admin"
+        />
         <HubCard
           to="/it-bear/notifications"
           icon={IconBell}

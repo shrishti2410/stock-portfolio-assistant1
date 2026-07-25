@@ -1,0 +1,43 @@
+# Trading Desk — production compose: app + Caddy (automatic HTTPS).
+#
+#   cp .env.deploy.example .env      # then edit values
+#   docker compose up -d --build
+#
+# APP_DOMAIN in .env controls the public hostname Caddy serves
+# (e.g. mytradingdesk.duckdns.org). With no domain it serves plain
+# HTTP on port 80 (fine for a first smoke test, not for real use).
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - app-data:/app/backend/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:

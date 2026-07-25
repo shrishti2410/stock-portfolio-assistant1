@@ -11,7 +11,7 @@ import { Link } from 'react-router-dom'
 import ITBearNav from './ITBearNav'
 import { fmtNum, fmtPct, pctColor } from '../../utils/format'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 // US IT stocks we track
 const US_SYMBOLS = ['ACN', 'IBM', 'CTSH', 'WIT', 'EPAM', 'GLOB', 'KFRC']

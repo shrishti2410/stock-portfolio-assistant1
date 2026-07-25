@@ -7,7 +7,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { PageHeader, Card, CardHeader, Button, MetricCard, StatusBadge, DataTable, LoadingSpinner } from '../ui'
 import { IconSettings, IconRefresh } from '../ui/icons'
 
-const API = 'http://localhost:8000'
+const API = ''
 
 const MODELS = {
   anthropic: ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-8'],

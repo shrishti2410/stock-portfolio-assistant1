@@ -10,7 +10,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import ITBearNav from './ITBearNav'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 function Toggle({ enabled, onChange, locked = false }) {
   return (

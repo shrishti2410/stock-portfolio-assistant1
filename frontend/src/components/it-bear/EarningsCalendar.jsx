@@ -10,7 +10,7 @@ import { useNavigate } from 'react-router-dom'
 import ITBearNav from './ITBearNav'
 import { fmtNum, fmtPct, daysUntil, earningsDaysColor, earningsSweetSpotBorder } from '../../utils/format'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 function Spinner() {
   return (

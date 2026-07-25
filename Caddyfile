@@ -1,0 +1,8 @@
+# Caddy reverse proxy — automatic HTTPS (Let's Encrypt) when APP_DOMAIN
+# is a real hostname (e.g. mytradingdesk.duckdns.org). Session cookies
+# get the Secure flag automatically because the app sees https.
+
+{$APP_DOMAIN} {
+	encode gzip
+	reverse_proxy app:8000
+}

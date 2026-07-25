@@ -10,7 +10,7 @@ import { Link } from 'react-router-dom'
 import ITBearNav from './ITBearNav'
 import { fmtNum } from '../../utils/format'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const LAYER_COLORS = {
   core: 'bg-red-500/20 border-red-500/30 text-red-300',

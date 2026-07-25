@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 // The 3 core strategies (must match backend trading/strategies.py IDs)
 const STRATEGY_DEFS = [
