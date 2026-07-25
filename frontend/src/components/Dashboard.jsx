@@ -17,7 +17,7 @@ import PortfolioTable from './PortfolioTable'
 import RecommendationCard from './RecommendationCard'
 import ConnectZerodha from './ConnectZerodha'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 export default function Dashboard() {
   const [data,        setData]        = useState([])

@@ -1,16 +1,108 @@
 /* Tailwind v4 — single import replaces @tailwind base/components/utilities */
 @import "tailwindcss";
 
-/* Full-height dark background */
+/* Class-based dark mode (default ON — toggled via <html class="dark">) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Fonts ─────────────────────────────────────────────────── */
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "Space Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* ── Semantic color tokens (light defaults) ────────────────── */
+:root {
+  --app-bg:        #f1f5f9;   /* slate-100 */
+  --surface:       #ffffff;
+  --surface-2:     #f8fafc;   /* slate-50  */
+  --edge:          #e2e8f0;   /* slate-200 */
+  --edge-strong:   #cbd5e1;   /* slate-300 */
+  --ink:           #0f172a;   /* slate-900 */
+  --ink-muted:     #64748b;   /* slate-500 */
+  --ink-subtle:    #94a3b8;   /* slate-400 */
+  --sidebar-bg:    #0f172a;   /* dark sidebar even in light mode (DQH style) */
+  --sidebar-ink:   #e2e8f0;
+  --brand:         #3b82f6;   /* blue-500 */
+  --brand-soft:    rgba(59, 130, 246, 0.12);
+}
+
+/* ── Dark mode overrides ───────────────────────────────────── */
+.dark {
+  --app-bg:        #0b1120;   /* deeper than slate-900 */
+  --surface:       #1e293b;   /* slate-800 */
+  --surface-2:     #172033;
+  --edge:          #334155;   /* slate-700 */
+  --edge-strong:   #475569;   /* slate-600 */
+  --ink:           #f1f5f9;   /* slate-100 */
+  --ink-muted:     #94a3b8;   /* slate-400 */
+  --ink-subtle:    #64748b;   /* slate-500 */
+  --sidebar-bg:    #0b1120;
+  --sidebar-ink:   #e2e8f0;
+  --brand:         #3b82f6;
+  --brand-soft:    rgba(59, 130, 246, 0.15);
+}
+
+/* ── Map tokens into Tailwind utilities (bg-surface, text-ink…) ── */
+@theme inline {
+  --color-app:         var(--app-bg);
+  --color-surface:     var(--surface);
+  --color-surface-2:   var(--surface-2);
+  --color-edge:        var(--edge);
+  --color-edge-strong: var(--edge-strong);
+  --color-ink:         var(--ink);
+  --color-ink-muted:   var(--ink-muted);
+  --color-ink-subtle:  var(--ink-subtle);
+  --color-sidebar:     var(--sidebar-bg);
+  --color-sidebar-ink: var(--sidebar-ink);
+  --color-brand:       var(--brand);
+  --color-brand-soft:  var(--brand-soft);
+}
+
+/* ── Base ──────────────────────────────────────────────────── */
 html,
 body {
   margin: 0;
   padding: 0;
-  background-color: #0f172a;
   min-height: 100vh;
+  background-color: var(--app-bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #root {
   width: 100%;
   min-height: 100vh;
+}
+
+/* Numbers / prices read cleaner in mono with tabular figures */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ── Custom scrollbar (thin, slate) ────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--edge-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--edge-strong);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-subtle);
+}
+
+/* Smooth theme transitions */
+html {
+  transition: background-color 0.2s ease, color 0.2s ease;
 }

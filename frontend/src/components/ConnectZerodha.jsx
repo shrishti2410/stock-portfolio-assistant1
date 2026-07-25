@@ -20,7 +20,7 @@
 
 import { useEffect, useState } from 'react'
 
-const API_BASE        = 'http://localhost:8000'
+const API_BASE        = ''
 const STORAGE_KEY     = 'zerodha_connected'
 
 function isStoredConnected() {
@@ -44,7 +44,7 @@ export default function ConnectZerodha({ onSuccess, onClose, onDisconnect }) {
     setStep('opening')
     setErrorMsg('')
     try {
-      const res = await fetch(`${API_BASE}/api/auth/login`)
+      const res = await fetch(`${API_BASE}/api/zerodha/login`)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.detail ?? `Server error ${res.status}`)
@@ -63,7 +63,7 @@ export default function ConnectZerodha({ onSuccess, onClose, onDisconnect }) {
     setStep('checking')
     setErrorMsg('')
     try {
-      const res = await fetch(`${API_BASE}/api/auth/status`)
+      const res = await fetch(`${API_BASE}/api/zerodha/status`)
       if (!res.ok) throw new Error(`Server error ${res.status}`)
       const { connected } = await res.json()
       if (connected) {
@@ -82,7 +82,7 @@ export default function ConnectZerodha({ onSuccess, onClose, onDisconnect }) {
   // ── Disconnect ────────────────────────────────────────────────────────────
   async function handleDisconnect() {
     try {
-      await fetch(`${API_BASE}/api/auth/logout`, { method: 'DELETE' })
+      await fetch(`${API_BASE}/api/zerodha/logout`, { method: 'DELETE' })
     } catch { /* best-effort */ }
     localStorage.removeItem(STORAGE_KEY)
     setStep('idle')

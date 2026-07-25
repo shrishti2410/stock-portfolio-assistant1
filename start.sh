@@ -67,6 +67,20 @@ else
     echo "⚠️  Frontend may still be starting (check /tmp/frontend.log)"
 fi
 
+# ── IT-Bear: pre-fetch today's earnings calendar (if stale) ───
+# The backend's startup hook already kicks this off, but we also poke the
+# endpoint here so the user sees a clear "refreshing" message on first launch.
+echo ""
+STATUS=$(curl -s http://localhost:8000/api/it-bear/earnings/refresh-status 2>/dev/null)
+if echo "$STATUS" | grep -q '"is_fresh_today": true'; then
+    echo "📅 IT-Bear earnings cache: ✅ fresh"
+else
+    echo "📅 IT-Bear earnings cache: ⏳ stale → refreshing in background (~25s)..."
+    # Fire and forget: hits the endpoint which is idempotent
+    curl -s -X POST "http://localhost:8000/api/it-bear/earnings/refresh" > /dev/null 2>&1 &
+    echo "   (Open Earnings tab in a moment to see fresh data)"
+fi
+
 # ── Open browser ─────────────────────────────────────────────
 echo ""
 echo "🌐 Opening dashboard in browser..."

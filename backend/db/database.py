@@ -23,6 +23,33 @@ async def init_db() -> None:
         schema = _SCHEMA_PATH.read_text()
         await db.executescript(schema)
         await db.commit()
+
+        # IT-Bear: safely add new columns to trading_config if they don't exist.
+        # SQLite ALTER TABLE only supports ADD COLUMN and has no IF NOT EXISTS.
+        # We query existing columns first to avoid errors on repeated startups.
+        it_bear_columns = {
+            "auto_layer_core": "INTEGER DEFAULT 0",
+            "auto_layer_tactical": "INTEGER DEFAULT 0",
+            "auto_layer_us": "INTEGER DEFAULT 0",
+            "auto_layer_hedge": "INTEGER DEFAULT 0",
+            "it_bear_enabled": "INTEGER DEFAULT 1",
+        }
+        existing_cols_rows = await db.execute_fetchall(
+            "PRAGMA table_info(trading_config)"
+        )
+        existing_cols = {row[1] for row in existing_cols_rows}
+
+        for col_name, col_def in it_bear_columns.items():
+            if col_name not in existing_cols:
+                try:
+                    await db.execute(
+                        f"ALTER TABLE trading_config ADD COLUMN {col_name} {col_def}"
+                    )
+                    await db.commit()
+                    print(f"[database] Added column trading_config.{col_name}")
+                except Exception as e:
+                    print(f"[database] Could not add column {col_name}: {e}")
+
     print(f"[database] Initialized at {_DB_PATH}")
 
 

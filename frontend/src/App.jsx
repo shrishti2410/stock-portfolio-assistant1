@@ -1,5 +1,12 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { useState, useEffect } from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { AppShell } from './shell/AppShell'
+import { AuthProvider, useAuth } from './shell/useAuth'
+import { LoadingSpinner } from './ui'
+
+// Auth
+import Login from './pages/Login'
+
+// Existing feature components (unchanged — reachable inside the new shell)
 import Dashboard from './components/Dashboard'
 import StockAnalysis from './components/StockAnalysis'
 import StrategyList from './components/StrategyList'
@@ -10,102 +17,128 @@ import IndicatorGlossary from './components/IndicatorGlossary'
 import OptionChain from './components/OptionChain'
 import MCXCommodities from './components/MCXCommodities'
 import PredefinedStrategies from './components/PredefinedStrategies'
-import StockSearch from './components/StockSearch'
 import TradingDashboard from './components/trading/TradingDashboard'
 import TradeApproval from './components/trading/TradeApproval'
 import TradingSettings from './components/trading/TradingSettings'
 import TradeHistory from './components/trading/TradeHistory'
 import PositionMonitor from './components/trading/PositionMonitor'
 
-const API_BASE = 'http://localhost:8000'
+// New section hub pages (Phase A)
+import StrategiesHub from './pages/StrategiesHub'
+import Backtest from './pages/Backtest'
+import MarketsHub from './pages/MarketsHub'
+import SettingsHub from './pages/SettingsHub'
+import LLMSettings from './pages/LLMSettings'
+import Marketplace from './pages/Marketplace'
+import StrategyDetail from './pages/StrategyDetail'
+import StrategyChat from './pages/StrategyChat'
+import BrokerSettings from './pages/BrokerSettings'
+import UsersAdmin from './pages/UsersAdmin'
 
-function TradingNavLink({ className }) {
-  const [engineRunning, setEngineRunning] = useState(false)
+// IT-Bear components
+import {
+  SectorDashboard,
+  EarningsCalendar,
+  ITUniverse,
+  StockDetail as ITStockDetail,
+  StrategyBuilder as ITStrategyBuilder,
+  Scanner,
+  NotificationSettings,
+  USSignals,
+} from './components/it-bear'
 
-  useEffect(() => {
-    let cancelled = false
+/** Gate for everything except /login: waits for the session check, then
+ *  either renders the app shell or bounces to /login. */
+function RequireAuth({ children }) {
+  const { user, loading } = useAuth()
 
-    async function checkStatus() {
-      try {
-        const res = await fetch(`${API_BASE}/api/trading/status`)
-        if (res.ok && !cancelled) {
-          const data = await res.json()
-          setEngineRunning(data.running ?? false)
-        }
-      } catch { /* ignore — backend may not be up */ }
-    }
-
-    checkStatus()
-    // Poll every 30 seconds for engine status
-    const interval = setInterval(checkStatus, 30000)
-    return () => { cancelled = true; clearInterval(interval) }
-  }, [])
-
-  return (
-    <NavLink to="/trading" className={className}>
-      <span className="flex items-center gap-1.5">
-        {engineRunning && (
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-        )}
-        Trading
-      </span>
-    </NavLink>
-  )
-}
-
-function NavBar() {
-  const linkClass = ({ isActive }) =>
-    `px-2.5 py-1.5 rounded-md text-sm font-medium transition-colors ${
-      isActive
-        ? 'bg-slate-700 text-white'
-        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-    }`
-
-  return (
-    <nav className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2 flex items-center justify-between">
-        <div className="flex items-center gap-0.5 overflow-x-auto">
-          <NavLink to="/" className={linkClass}>Dashboard</NavLink>
-          <TradingNavLink className={linkClass} />
-          <NavLink to="/options" className={linkClass}>Options</NavLink>
-          <NavLink to="/mcx" className={linkClass}>MCX</NavLink>
-          <NavLink to="/history" className={linkClass}>History</NavLink>
-          <NavLink to="/fo-strategies" className={linkClass}>F&O Playbook</NavLink>
-          <NavLink to="/strategies" className={linkClass}>My Strategies</NavLink>
-          <NavLink to="/alerts" className={linkClass}>Alerts</NavLink>
-          <NavLink to="/glossary" className={linkClass}>Indicators</NavLink>
-        </div>
-        <StockSearch />
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-app">
+        <LoadingSpinner message="Loading your session…" />
       </div>
-    </nav>
-  )
+    )
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />
+  }
+
+  return children
 }
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <div className="min-h-screen bg-[#0f172a] text-slate-100 font-sans">
-        <NavBar />
+    <AuthProvider>
+      <BrowserRouter>
         <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/stock/:symbol" element={<StockAnalysis />} />
-          <Route path="/options" element={<OptionChain />} />
-          <Route path="/mcx" element={<MCXCommodities />} />
-          <Route path="/history" element={<AnalysisHistory />} />
-          <Route path="/fo-strategies" element={<PredefinedStrategies />} />
-          <Route path="/strategies" element={<StrategyList />} />
-          <Route path="/strategies/new" element={<StrategyBuilder />} />
-          <Route path="/strategies/:id" element={<StrategyBuilder />} />
-          <Route path="/alerts" element={<AlertsPanel />} />
-          <Route path="/glossary" element={<IndicatorGlossary />} />
-          {/* Trading routes */}
-          <Route path="/trading" element={<TradingDashboard />} />
-          <Route path="/trading/approve/:id" element={<TradeApproval />} />
-          <Route path="/trading/settings" element={<TradingSettings />} />
-          <Route path="/trading/history" element={<TradeHistory />} />
-          <Route path="/trading/positions" element={<PositionMonitor />} />
+          <Route path="/login" element={<Login />} />
+
+          <Route
+            path="/*"
+            element={
+              <RequireAuth>
+                <AppShell>
+                  <Routes>
+                    {/* ── Portfolio (was Dashboard + History) ── */}
+                    <Route path="/" element={<Dashboard />} />
+                    <Route path="/portfolio" element={<Dashboard />} />
+                    <Route path="/stock/:symbol" element={<StockAnalysis />} />
+                    <Route path="/history" element={<AnalysisHistory />} />
+
+                    {/* ── Strategies ── */}
+                    <Route path="/marketplace" element={<Marketplace />} />
+                    <Route path="/marketplace/chat" element={<StrategyChat />} />
+                    <Route path="/marketplace/:slug" element={<StrategyDetail />} />
+                    <Route path="/strategies" element={<StrategiesHub />} />
+                    <Route path="/strategies/custom" element={<StrategyList />} />
+                    <Route path="/strategies/new" element={<StrategyBuilder />} />
+                    <Route path="/strategies/:id" element={<StrategyBuilder />} />
+                    <Route path="/fo-strategies" element={<PredefinedStrategies />} />
+
+                    {/* ── Backtest (Phase C) ── */}
+                    <Route path="/backtest" element={<Backtest />} />
+
+                    {/* ── Trading ── */}
+                    <Route path="/trading" element={<TradingDashboard />} />
+                    <Route path="/trading/approve/:id" element={<TradeApproval />} />
+                    <Route path="/trading/settings" element={<TradingSettings />} />
+                    <Route path="/trading/history" element={<TradeHistory />} />
+                    <Route path="/trading/positions" element={<PositionMonitor />} />
+
+                    {/* ── Signals (was Alerts) ── */}
+                    <Route path="/signals" element={<AlertsPanel />} />
+                    <Route path="/alerts" element={<AlertsPanel />} />
+
+                    {/* ── Markets (Options + MCX + Earnings) ── */}
+                    <Route path="/markets" element={<MarketsHub />} />
+                    <Route path="/options" element={<OptionChain />} />
+                    <Route path="/mcx" element={<MCXCommodities />} />
+
+                    {/* ── Settings (Notifications + Glossary + LLM + Broker + Users) ── */}
+                    <Route path="/settings" element={<SettingsHub />} />
+                    <Route path="/settings/broker" element={<BrokerSettings />} />
+                    <Route path="/settings/users" element={<UsersAdmin />} />
+                    <Route path="/settings/llm" element={<LLMSettings />} />
+                    <Route path="/glossary" element={<IndicatorGlossary />} />
+
+                    {/* ── IT-Bear thesis ── */}
+                    <Route path="/it-bear" element={<SectorDashboard />} />
+                    <Route path="/it-bear/earnings" element={<EarningsCalendar />} />
+                    <Route path="/it-bear/universe" element={<ITUniverse />} />
+                    <Route path="/it-bear/stock/:symbol" element={<ITStockDetail />} />
+                    <Route path="/it-bear/strategy-builder" element={<ITStrategyBuilder />} />
+                    <Route path="/it-bear/strategy-builder/:symbol" element={<ITStrategyBuilder />} />
+                    <Route path="/it-bear/scanner" element={<Scanner />} />
+                    <Route path="/it-bear/notifications" element={<NotificationSettings />} />
+                    <Route path="/it-bear/us-signals" element={<USSignals />} />
+                  </Routes>
+                </AppShell>
+              </RequireAuth>
+            }
+          />
         </Routes>
-      </div>
-    </BrowserRouter>
+      </BrowserRouter>
+    </AuthProvider>
   )
 }

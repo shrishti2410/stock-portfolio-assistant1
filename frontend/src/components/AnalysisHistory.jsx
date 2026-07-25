@@ -6,7 +6,7 @@
 import { useState, useEffect } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const REC_STYLE = {
   Buy:  'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',

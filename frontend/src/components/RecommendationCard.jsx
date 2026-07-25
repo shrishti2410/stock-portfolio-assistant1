@@ -17,7 +17,7 @@
 
 import { useEffect, useState } from 'react'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const BADGE = {
   Buy:  { bg: 'bg-emerald-500/20', text: 'text-emerald-300', border: 'border-emerald-500/40', label: 'BUY'  },

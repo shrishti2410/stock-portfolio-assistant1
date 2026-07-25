@@ -8,7 +8,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 const EXAMPLE_STRATEGIES = [
   'Buy when RSI drops below 30 and MACD crosses above signal line',

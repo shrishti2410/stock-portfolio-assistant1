@@ -189,3 +189,239 @@ CREATE TABLE IF NOT EXISTS order_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_log_position ON order_log(position_id);
+
+-- ============================================================
+-- IT-BEAR MODULE ADDITIONS
+-- ============================================================
+
+-- Per-layer auto-execution toggle (appended to trading_config)
+-- SQLite ALTER TABLE only allows ADD COLUMN, and only if column doesn't exist.
+-- We use a safe migration pattern with INSERT OR IGNORE + UPDATE.
+CREATE TABLE IF NOT EXISTS _migration_guard (
+    migration_key TEXT PRIMARY KEY,
+    applied_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add IT-bear layer toggle columns to trading_config (idempotent via trigger approach)
+-- SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we catch errors in init_db().
+-- These columns are declared here as documentation; actual migration is in database.py.
+
+-- Earnings calendar cache
+CREATE TABLE IF NOT EXISTS earnings_calendar (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT    NOT NULL,
+    earnings_date TEXT,
+    fetched_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_calendar_symbol ON earnings_calendar(symbol);
+
+-- Earnings history (last 4 quarters per symbol)
+CREATE TABLE IF NOT EXISTS earnings_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol          TEXT    NOT NULL,
+    period          TEXT    NOT NULL,
+    revenue         REAL,
+    earnings        REAL,
+    eps             REAL,
+    revenue_yoy_pct REAL,
+    fetched_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_history_symbol ON earnings_history(symbol, period);
+
+-- Notification log (all channels)
+CREATE TABLE IF NOT EXISTS notification_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    type          TEXT    NOT NULL,      -- "trade_alert" | "daily_brief" | "risk_alert" | "test"
+    channel       TEXT    NOT NULL,      -- "email" | "telegram" | "websocket"
+    subject       TEXT,
+    body          TEXT,
+    success       INTEGER DEFAULT 0,     -- 1 = sent, 0 = failed / not configured
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_log_sent ON notification_log(sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_log_channel ON notification_log(channel, success);
+
+-- ============================================================
+-- LLM GATEWAY — cost observability + hard budget limits
+-- ============================================================
+
+-- Single-row config (id=1). All LLM calls obey these limits.
+CREATE TABLE IF NOT EXISTS llm_config (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled             INTEGER DEFAULT 1,        -- master switch for all LLM features
+    provider            TEXT    DEFAULT 'anthropic',  -- anthropic | openai | groq | gemini
+    default_model       TEXT    DEFAULT 'claude-haiku-4-5-20251001',  -- cheapest capable by default
+    daily_limit_usd     REAL    DEFAULT 1.0,      -- hard daily spend cap
+    monthly_limit_usd   REAL    DEFAULT 10.0,     -- hard monthly spend cap
+    per_call_max_tokens INTEGER DEFAULT 1500,     -- max output tokens per call
+    calls_per_min       INTEGER DEFAULT 12,       -- rate limit
+    cache_enabled       INTEGER DEFAULT 1,        -- response caching to avoid dup spend
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO llm_config (id) VALUES (1);
+
+-- Every LLM call (or blocked attempt) is logged here for observability.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    feature       TEXT,                  -- 'strategy_chat' | 'rule_parse' | 'analysis' | ...
+    provider      TEXT,
+    model         TEXT,
+    input_tokens  INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd      REAL    DEFAULT 0,
+    cached        INTEGER DEFAULT 0,     -- 1 if served from cache (cost 0)
+    latency_ms    INTEGER,
+    status        TEXT    DEFAULT 'ok',  -- ok | budget_blocked | rate_limited | disabled | error
+    error         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_feature ON llm_usage(feature);
+
+-- Response cache (avoids paying twice for identical prompts).
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key   TEXT PRIMARY KEY,        -- sha256(provider|model|system|prompt|max_tokens)
+    response    TEXT,
+    model       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- UNIFIED STRATEGIES (Phase B marketplace)
+-- ============================================================
+
+-- One row per strategy, regardless of source (predefined / custom / it-bear / llm-authored).
+CREATE TABLE IF NOT EXISTS strategy_defs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug            TEXT UNIQUE,             -- stable id, e.g. 'iron_condor' or 'custom_17'
+    name            TEXT NOT NULL,
+    source          TEXT NOT NULL,           -- 'predefined' | 'it_bear' | 'custom' | 'llm'
+    category        TEXT,                    -- 'options' | 'directional' | 'commodity' | 'event' | ...
+    market          TEXT DEFAULT 'IN',       -- 'IN' | 'US' | 'BOTH'
+    direction       TEXT,                    -- 'bullish' | 'bearish' | 'neutral' | 'any'
+    description     TEXT,
+    entry_conditions TEXT DEFAULT '[]',      -- JSON array of {indicator, operator, value, note}
+    exit_conditions  TEXT DEFAULT '[]',      -- JSON array
+    legs            TEXT DEFAULT '[]',       -- JSON array of option legs (if applicable)
+    config          TEXT DEFAULT '{}',       -- JSON: tunable params (thresholds, sizing, time windows)
+    risk            TEXT,                    -- 'low' | 'medium' | 'high'
+    tags            TEXT DEFAULT '[]',       -- JSON array
+    is_editable     INTEGER DEFAULT 1,       -- predefined originals are read-only (fork to edit)
+    forked_from     TEXT,                    -- slug of parent if forked
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_defs_source ON strategy_defs(source);
+CREATE INDEX IF NOT EXISTS idx_strategy_defs_category ON strategy_defs(category);
+
+-- Chat history for LLM-assisted strategy authoring (per draft session).
+CREATE TABLE IF NOT EXISTS strategy_chats (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,               -- groups messages of one authoring session
+    role        TEXT NOT NULL,               -- 'user' | 'assistant'
+    content     TEXT NOT NULL,
+    draft       TEXT,                        -- JSON snapshot of the strategy draft after this turn
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_chats_session ON strategy_chats(session_id, created_at);
+
+-- ============================================================
+-- HISTORICAL DATA STORE (Phase C — our own local bars database)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS hist_bars (
+    symbol    TEXT NOT NULL,        -- 'NIFTY', 'BANKNIFTY', 'GC=F', 'AAPL', '^INDIAVIX', …
+    timeframe TEXT NOT NULL,        -- '1m' | '5m' | '15m' | '1d'
+    ts        TEXT NOT NULL,        -- UTC ISO datetime
+    open REAL, high REAL, low REAL, close REAL,
+    volume    REAL DEFAULT 0,
+    oi        REAL,
+    source    TEXT,                 -- 'yfinance' | 'dhan' | 'alpaca' | 'jugaad'
+    PRIMARY KEY (symbol, timeframe, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_hist_bars_lookup ON hist_bars(symbol, timeframe, ts);
+
+-- Coverage metadata (what we hold locally, per symbol+timeframe)
+CREATE TABLE IF NOT EXISTS hist_meta (
+    symbol     TEXT NOT NULL,
+    timeframe  TEXT NOT NULL,
+    first_ts   TEXT,
+    last_ts    TEXT,
+    bar_count  INTEGER DEFAULT 0,
+    source     TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, timeframe)
+);
+
+-- ============================================================
+-- BACKTESTING (Phase C/D)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_slug  TEXT NOT NULL,
+    config         TEXT DEFAULT '{}',     -- JSON config used (after overrides)
+    universe       TEXT DEFAULT '[]',     -- JSON list of symbols
+    timeframe      TEXT DEFAULT '5m',
+    start_date     TEXT,
+    end_date       TEXT,
+    initial_capital REAL DEFAULT 100000,
+    status         TEXT DEFAULT 'running', -- running | done | error
+    metrics        TEXT,                  -- JSON summary metrics
+    equity_curve   TEXT,                  -- JSON [[ts, equity], ...]
+    error          TEXT,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at    TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_created ON backtest_runs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER REFERENCES backtest_runs(id) ON DELETE CASCADE,
+    symbol      TEXT,
+    direction   TEXT,          -- long | short | long_ce | long_pe
+    entry_ts    TEXT,
+    entry_price REAL,
+    exit_ts     TEXT,
+    exit_price  REAL,
+    qty         REAL,
+    pnl         REAL,
+    pnl_pct     REAL,
+    exit_reason TEXT,          -- target | stop | time | signal
+    meta        TEXT           -- JSON extras (strike, synthetic spread, day trend, …)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id);
+
+-- ============================================================
+-- AUTH (multi-user)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,        -- pbkdf2$<iters>$<salt_b64>$<hash_b64>
+    display_name TEXT,
+    is_admin INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL,           -- ISO UTC
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+-- Per-user settings (broker creds etc.), values optionally encrypted
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT,
+    encrypted INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, key)
+);

@@ -1,0 +1,44 @@
+# Coolify deployment compose.
+#
+# Use THIS file (not docker-compose.yml) when deploying through Coolify.
+# Coolify already runs its own reverse proxy (Traefik) on ports 80/443 and
+# issues Let's Encrypt certificates, so we must NOT run our own Caddy or bind
+# host ports here — we only expose the app and let Coolify route to it.
+#
+# In Coolify: New Resource → Docker Compose → point at this file, then set the
+# app's domain in the UI mapped to port 8000. Env vars are set in Coolify's
+# "Environment Variables" tab (APP_SECRET_KEY, APP_ADMIN_USER, APP_ADMIN_PASSWORD,
+# APP_DOMAIN, and any optional LLM/Telegram/data keys).
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Coolify injects the vars you set in its UI; these defaults are fallbacks.
+      - APP_SECRET_KEY=${APP_SECRET_KEY}
+      - APP_ADMIN_USER=${APP_ADMIN_USER:-admin}
+      - APP_ADMIN_PASSWORD=${APP_ADMIN_PASSWORD:-admin}
+      - APP_DOMAIN=${APP_DOMAIN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - ALPACA_API_KEY=${ALPACA_API_KEY:-}
+      - ALPACA_API_SECRET=${ALPACA_API_SECRET:-}
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+    volumes:
+      - app-data:/app/backend/data
+    expose:
+      - "8000"          # Coolify proxies the domain → this port (no host binding)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  app-data:

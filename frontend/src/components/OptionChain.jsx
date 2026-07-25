@@ -5,7 +5,7 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 function fmt(n) {
   if (n === undefined || n === null) return '—'

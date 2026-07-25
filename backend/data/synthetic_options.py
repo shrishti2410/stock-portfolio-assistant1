@@ -21,13 +21,59 @@ YF_SYMBOLS = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
     "FINNIFTY": "^CNXFIN",
+    "NIFTYIT": "^CNXIT",
+    "NIFTY IT": "^CNXIT",
 }
 
 STRIKE_STEPS = {
     "NIFTY": 50,
     "BANKNIFTY": 100,
     "FINNIFTY": 50,
+    "NIFTYIT": 100,
+    "NIFTY IT": 100,
 }
+
+
+def _resolve_yf_ticker(symbol: str) -> str:
+    """Map a trading symbol to its yfinance ticker.
+
+    1. Index symbols → fixed map above
+    2. Indian stocks → check IT universe (returns yf field) → fall back to {SYMBOL}.NS
+    3. US stocks → use as-is
+    """
+    sym = symbol.upper().strip()
+    if sym in YF_SYMBOLS:
+        return YF_SYMBOLS[sym]
+    try:
+        from data.it_universe import get_by_symbol
+        stock = get_by_symbol(sym)
+        if stock and stock.get("yf"):
+            return stock["yf"]
+    except Exception:
+        pass
+    # Heuristic fallback
+    if "." in sym:
+        return sym
+    return f"{sym}.NS"
+
+
+def _resolve_strike_step(symbol: str, spot: float) -> int:
+    """Pick a reasonable strike step for the symbol/price."""
+    sym = symbol.upper().strip()
+    if sym in STRIKE_STEPS:
+        return STRIKE_STEPS[sym]
+    # Heuristic based on price level (rounding to look realistic)
+    if spot >= 10000:
+        return 100
+    if spot >= 2000:
+        return 50
+    if spot >= 500:
+        return 10
+    if spot >= 100:
+        return 5
+    if spot >= 20:
+        return 1
+    return 1
 
 
 def _bs_price(S: float, K: float, T: float, r: float, sigma: float, option_type: str) -> float:
@@ -56,7 +102,7 @@ def _next_thursday(from_date: date) -> date:
 
 def _get_spot_and_vix(symbol: str) -> tuple[float, float]:
     """Fetch last close from yfinance. Returns (spot, vix)."""
-    yf_sym = YF_SYMBOLS.get(symbol.upper(), "^NSEI")
+    yf_sym = _resolve_yf_ticker(symbol)
 
     spot_ticker = yf.Ticker(yf_sym)
     hist = spot_ticker.history(period="5d")
@@ -78,7 +124,7 @@ def generate_synthetic_chain(symbol: str) -> dict:
     symbol = symbol.upper().strip()
     spot, vix = _get_spot_and_vix(symbol)
     sigma = vix / 100  # VIX is annualized %, convert to decimal
-    step = STRIKE_STEPS.get(symbol, 50)
+    step = _resolve_strike_step(symbol, spot)
 
     # Round spot to nearest strike
     atm = round(spot / step) * step

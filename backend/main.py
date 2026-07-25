@@ -12,10 +12,16 @@ GET  /api/analysis/ai/{symbol}          → multi-agent AI analysis (slow, 600s 
 GET  /api/analyze/{symbol}              → full analysis for any stock (screening + AI)
 GET  /api/search/stocks?q=              → autocomplete symbol search
 DEL  /api/analysis/cache                → clear AI cache
-GET  /api/auth/login                    → returns Zerodha login URL
-GET  /api/auth/callback?request_token=  → exchanges token, saves to .env
-GET  /api/auth/status                   → check if Zerodha connected
-DEL  /api/auth/logout                   → clears Zerodha token
+GET  /api/zerodha/login                 → returns Zerodha login URL
+GET  /api/zerodha/callback?request_token= → exchanges token, saves to .env
+GET  /api/zerodha/status                → check if Zerodha connected
+DEL  /api/zerodha/logout                → clears Zerodha token
+POST /api/auth/login                    → multi-user login (sets session cookie)
+POST /api/auth/logout                   → multi-user logout
+GET  /api/auth/me                       → current authenticated user
+                                           (see routers/auth_api.py, routers/broker_api.py
+                                            for the full multi-user auth + per-user
+                                            broker credential API)
 POST /api/strategies                    → create strategy from natural language
 GET  /api/strategies                    → list all strategies
 GET  /api/strategies/{id}               → strategy detail with rules
@@ -29,15 +35,19 @@ PUT  /api/alerts/{id}/read              → mark alert as read
 
 import asyncio
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from zerodha.client import get_holdings
+from zerodha.client import get_holdings, get_holdings_for_user
 from zerodha.auth import get_login_url, exchange_token
 from analysis.analyzer import analyze_stock_ai, _ai_cache
+from auth.service import get_session_user
+from auth.seed import ensure_admin
 
 load_dotenv()
 
@@ -47,6 +57,56 @@ load_dotenv()
 
 app = FastAPI(title="Stock Portfolio Assistant", version="0.1.0")
 
+# ── Feature routers (Phase B/C/D: marketplace, chat authoring, data, backtest, auth) ──
+from routers.marketplace import router as marketplace_router
+from routers.marketplace_chat import router as marketplace_chat_router
+from routers.data_api import router as data_router
+from routers.backtest_api import router as backtest_router
+from routers.auth_api import router as auth_api_router
+from routers.broker_api import router as broker_api_router
+
+app.include_router(marketplace_router)
+app.include_router(marketplace_chat_router)
+app.include_router(data_router)
+app.include_router(backtest_router)
+app.include_router(auth_api_router)
+app.include_router(broker_api_router)
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware — protects all /api/* routes except a small allowlist.
+# Any path NOT starting with /api/ (static SPA assets, index.html, etc.) is
+# always let through untouched so the login page itself can load.
+# ---------------------------------------------------------------------------
+
+_AUTH_ALLOWLIST_EXACT = {"/health", "/api/auth/login"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # CORS preflight requests never carry cookies and must reach
+    # CORSMiddleware untouched, regardless of auth state.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _AUTH_ALLOWLIST_EXACT or not path.startswith("/api/"):
+        return await call_next(request)
+
+    token = request.cookies.get("session")
+    user = await get_session_user(token) if token else None
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    request.state.user = user
+    return await call_next(request)
+
+
+# NOTE: CORSMiddleware is registered AFTER auth_middleware above so it ends up
+# as the OUTERMOST layer — Starlette wraps middleware in the reverse order
+# they're added (the most-recently-added becomes outermost). This guarantees
+# CORS headers are present even on 401 responses from auth_middleware, and
+# that preflight requests are always handled correctly.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],  # Vite dev server
@@ -171,18 +231,20 @@ async def health_check():
 
 
 @app.get("/api/portfolio")
-async def get_portfolio():
+async def get_portfolio(request: Request):
     """
-    Return the current portfolio holdings.
+    Return the current portfolio holdings for the authenticated user.
 
-    Uses Zerodha Kite Connect when ZERODHA_ACCESS_TOKEN is set,
-    otherwise returns dummy data (see zerodha/client.py).
+    Uses that user's own Zerodha credentials when configured (Settings UI),
+    falls back to legacy env credentials for admins, otherwise dummy data
+    (see zerodha/client.py get_holdings_for_user()).
 
     Response shape (list):
         symbol, quantity, average_price, last_price, pnl, pnl_percentage
     """
+    user = getattr(request.state, "user", None)
     try:
-        holdings = await get_holdings()
+        holdings = await get_holdings_for_user(user)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch holdings: {exc}")
     return holdings
@@ -275,9 +337,10 @@ async def get_analysis(symbol: str):
 
 
 @app.get("/api/dashboard")
-async def get_dashboard():
+async def get_dashboard(request: Request):
     """
-    Return holdings merged with rule-based analysis for every stock.
+    Return holdings merged with rule-based analysis for every stock, for the
+    authenticated user (see get_holdings_for_user() in zerodha/client.py).
 
     Fetches all holdings in one call, then fans out analysis concurrently
     via asyncio.gather so the response time doesn't grow linearly with
@@ -287,10 +350,11 @@ async def get_dashboard():
         symbol, quantity, avg_price, current_price,
         pnl, pnl_pct, recommendation, reasoning, trend, confidence
     """
+    user = getattr(request.state, "user", None)
     try:
-        holdings = await get_holdings()
+        holdings = await get_holdings_for_user(user)
     except Exception:
-        # get_holdings() should never raise (it catches internally),
+        # get_holdings_for_user() should never raise (it catches internally),
         # but if something unexpected slips through, serve dummy data.
         from zerodha.client import _dummy_holdings
         holdings = _dummy_holdings()
@@ -404,7 +468,7 @@ async def analyze_external_stock(symbol: str):
 # Auth routes
 # ---------------------------------------------------------------------------
 
-@app.get("/api/auth/login")
+@app.get("/api/zerodha/login")
 async def auth_login():
     """
     Return the Zerodha login URL so the frontend can open it in a new tab.
@@ -425,7 +489,7 @@ async def auth_login():
     return {"login_url": login_url}
 
 
-@app.get("/api/auth/callback", response_class=HTMLResponse)
+@app.get("/api/zerodha/callback", response_class=HTMLResponse)
 async def auth_callback(
     request_token: str = Query(None),
     action: str = Query(None),
@@ -457,7 +521,7 @@ async def auth_callback(
     return HTMLResponse(_html_page(success=True))
 
 
-@app.get("/api/auth/status")
+@app.get("/api/zerodha/status")
 async def auth_status():
     """
     Return whether a Zerodha access token is configured.
@@ -469,7 +533,7 @@ async def auth_status():
     return {"connected": connected, "source": "zerodha" if connected else "dummy"}
 
 
-@app.delete("/api/auth/logout")
+@app.delete("/api/zerodha/logout")
 async def auth_logout():
     """
     Clear the Zerodha access token from .env and the live process env.
@@ -490,12 +554,60 @@ async def auth_logout():
 async def startup():
     from db.database import init_db
     await init_db()
+
+    # Multi-user auth: ensure a default admin exists (idempotent), and
+    # migrate any legacy .env Zerodha credentials into their user_settings.
+    try:
+        await ensure_admin()
+    except Exception as e:
+        print(f"[startup] ensure_admin failed: {e}")
+
     # Sync market events to DB
     try:
         from trading.events import sync_events_to_db
         await sync_events_to_db()
     except Exception as e:
         print(f"[startup] Event sync: {e}")
+
+    # IT-Bear morning refresh: if today's earnings cache is stale, fire a
+    # background refresh so the user has fresh data when they open the UI.
+    # First-of-the-day startup only — no-ops on subsequent restarts.
+    async def _morning_refresh():
+        try:
+            from data.earnings_calendar import (
+                is_cache_fresh_today, refresh_universe_earnings_cache,
+            )
+            if await is_cache_fresh_today():
+                print("[startup] IT-Bear earnings cache fresh — skipping refresh.")
+                return
+            print("[startup] IT-Bear earnings cache stale → refreshing in background...")
+            await refresh_universe_earnings_cache()
+        except Exception as e:
+            print(f"[startup] IT-Bear morning refresh failed: {e}")
+
+    asyncio.create_task(_morning_refresh())
+
+    # Seed the unified strategy marketplace (idempotent — skips existing slugs)
+    try:
+        from marketplace.seeds import seed_all
+        result = await seed_all()
+        print(f"[startup] Marketplace seed: {result}")
+    except Exception as e:
+        print(f"[startup] Marketplace seed failed: {e}")
+
+    # Telegram long-poll listener — only starts if TELEGRAM_BOT_TOKEN is set
+    async def _start_telegram():
+        try:
+            from notifications.telegram_listener import start_listener, _is_configured
+            if _is_configured():
+                result = await start_listener()
+                print(f"[startup] Telegram listener: {result}")
+            else:
+                print("[startup] Telegram listener: not configured (TELEGRAM_BOT_TOKEN missing)")
+        except Exception as e:
+            print(f"[startup] Telegram listener failed to start: {e}")
+
+    asyncio.create_task(_start_telegram())
 
 
 @app.post("/api/strategies")
@@ -1038,6 +1150,154 @@ async def trading_get_proposals(status: str = Query(None)):
         return [_transform_proposal(dict(r)) for r in rows]
 
 
+@app.post("/api/trading/proposals")
+async def trading_create_proposal(body: dict):
+    """
+    Manually create a trade proposal (e.g., from the Strategy Builder).
+
+    Body accepts the frontend-friendly shape:
+      symbol, strategy_name, direction, mode, legs, max_profit, max_loss,
+      margin_required (or margin_needed), confidence_score (0-100, or confidence 0-1),
+      reasoning, source, layer
+    Returns the proposal ID + status.
+
+    If body.auto_execute is True (default), runs through risk checks +
+    OrderManager immediately. Otherwise saves as 'pending' for manual approval.
+    """
+    import json as _json
+    from trading.engine import trading_engine
+    from db.database import _get_db
+
+    # Normalize input
+    symbol = str(body.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="'symbol' is required")
+
+    # Frontend may send confidence as 0-100 OR 0-1. Normalize to 0-1.
+    conf_raw = body.get("confidence_score", body.get("confidence", 50))
+    confidence = float(conf_raw) / 100 if conf_raw > 1 else float(conf_raw)
+
+    # Frontend may send margin_required OR margin_needed
+    margin = float(body.get("margin_required", body.get("margin_needed", 0)) or 0)
+
+    # Strategy id — best effort from name
+    strategy_id = body.get("strategy_id") or _strategy_id_from_name(body.get("strategy_name", ""))
+
+    # Legs: normalize action UPPERCASE, ensure option_type / type both present
+    raw_legs = body.get("legs", []) or []
+    legs = []
+    for leg in raw_legs:
+        action = str(leg.get("action", "")).upper()
+        opt_type = leg.get("type") or leg.get("option_type") or ""
+        legs.append({
+            "action": action.lower(),  # canonical lower-case for engine
+            "type": opt_type,
+            "option_type": opt_type,
+            "strike": int(leg.get("strike", 0)),
+            "qty": int(leg.get("qty", leg.get("quantity", 0))),
+            "ltp": float(leg.get("ltp", 0)),
+            "iv": float(leg.get("iv", 0)),
+        })
+
+    # Save as pending proposal
+    proposal_record = {
+        "strategy_id": strategy_id,
+        "symbol": symbol,
+        "direction": str(body.get("direction", "bearish")).lower(),
+        "legs_json": _json.dumps(legs),
+        "greeks_json": _json.dumps(body.get("greeks", {})),
+        "intelligence_json": _json.dumps({
+            "layer": body.get("layer", "tactical"),
+            "source": body.get("source", "manual"),
+            "strategy_theme": "it_bear_thesis",
+        }),
+        "max_profit": float(body.get("max_profit", 0) or 0),
+        "max_loss": float(body.get("max_loss", 0) or 0),
+        "margin_needed": margin,
+        "confidence": confidence,
+        "reasoning": str(body.get("reasoning", "")),
+    }
+
+    async with _get_db() as db:
+        cursor = await db.execute(
+            """INSERT INTO trade_proposals
+               (strategy_id, symbol, direction, legs, greeks, intelligence,
+                max_profit, max_loss, margin_needed, confidence, reasoning,
+                risk_checks, status, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 'pending',
+                       datetime('now', '+30 minutes'))""",
+            (proposal_record["strategy_id"], proposal_record["symbol"],
+             proposal_record["direction"], proposal_record["legs_json"],
+             proposal_record["greeks_json"], proposal_record["intelligence_json"],
+             proposal_record["max_profit"], proposal_record["max_loss"],
+             proposal_record["margin_needed"], proposal_record["confidence"],
+             proposal_record["reasoning"]),
+        )
+        await db.commit()
+        proposal_id = cursor.lastrowid
+
+    # Auto-execute by default (frontend "Execute as Paper Trade" expects execution).
+    # For MANUAL proposals from the Strategy Builder, the user has explicitly chosen
+    # the trade — so we auto-enable engine_enabled + add this strategy to
+    # enabled_strategies before running risk checks (the engine_enabled and
+    # strategy_enabled gates are meant for the auto-scanner, not user-initiated trades).
+    auto_execute = bool(body.get("auto_execute", True))
+    if auto_execute:
+        async with _get_db() as db:
+            import aiosqlite
+            db.row_factory = aiosqlite.Row
+            # Auto-enable engine flag
+            await db.execute(
+                "UPDATE trading_config SET engine_enabled = 1 WHERE id = 1"
+            )
+            # Add this strategy to enabled list if not already
+            rows = await db.execute_fetchall("SELECT strategies_enabled FROM trading_config WHERE id = 1")
+            if rows:
+                enabled = _json.loads(rows[0]["strategies_enabled"] or "[]")
+                if strategy_id not in enabled:
+                    enabled.append(strategy_id)
+                    await db.execute(
+                        "UPDATE trading_config SET strategies_enabled = ? WHERE id = 1",
+                        (_json.dumps(enabled),)
+                    )
+            await db.commit()
+
+        result = await trading_engine.execute_approved(proposal_id)
+        if "error" in result:
+            return {
+                "proposal_id": proposal_id,
+                "status": "rejected",
+                "error": result["error"],
+                "message": f"Proposal saved but execution failed: {result['error']}",
+            }
+        return {
+            "proposal_id": proposal_id,
+            "position_id": result.get("position_id"),
+            "status": "executed",
+            "message": f"Paper trade executed. Position #{result.get('position_id')} created.",
+        }
+
+    return {
+        "proposal_id": proposal_id,
+        "status": "pending",
+        "message": f"Proposal #{proposal_id} created. Approve from dashboard to execute.",
+    }
+
+
+def _strategy_id_from_name(name: str) -> str:
+    """Best-effort map strategy name → canonical strategy_id."""
+    n = (name or "").lower()
+    if "iron condor" in n: return "iron_condor"
+    if "straddle" in n and ("sell" in n or "short" in n or "adjust" in n): return "straddle_adjust"
+    if "bear put" in n or "put spread" in n: return "it_bear_put_spread"
+    if "bear call" in n or "call spread" in n: return "it_bear_call_spread"
+    if "pre-earnings" in n or "pre earnings" in n: return "it_pre_earnings_put"
+    if "long put" in n: return "it_long_put_breakdown"
+    if "nifty it" in n and "future" in n: return "it_nifty_futures_short"
+    if "directional" in n: return "directional_spread"
+    return "manual_proposal"
+
+
 @app.get("/api/trading/proposals/{proposal_id}")
 async def trading_get_proposal(proposal_id: int):
     """Get full proposal detail."""
@@ -1218,13 +1478,820 @@ async def trading_reset_circuit_breaker():
 
 
 # ---------------------------------------------------------------------------
+# IT-Bear Module API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/it-bear/universe")
+async def it_bear_universe():
+    """
+    List of IT stocks with current price + key metadata.
+    Combines static universe data + current prices via yfinance.
+    """
+    from data.it_universe import get_all
+    from analysis.it_sector_health import get_sector_heatmap
+
+    stocks = get_all()
+    # Enrich with live prices from sector heatmap (cached 15min)
+    try:
+        heatmap = await get_sector_heatmap()
+        price_map = {s["symbol"]: s for s in heatmap}
+    except Exception:
+        price_map = {}
+
+    result = []
+    for s in stocks:
+        sym = s["symbol"]
+        live = price_map.get(sym, {})
+        result.append({
+            "symbol": sym,
+            "name": s.get("name", sym),
+            "country": s.get("country", ""),
+            "tier": s.get("tier", ""),
+            "segment": s.get("segment", ""),
+            "lot_size": s.get("lot_size"),
+            "fno": s.get("fno", False),
+            "notes": s.get("notes", ""),
+            "yf": s.get("yf", sym),
+            "price": live.get("price"),
+            "change_pct_1d": live.get("change_pct_1d"),
+            "change_pct_5d": live.get("change_pct_5d"),
+            "change_pct_20d": live.get("change_pct_20d"),
+            "rsi": live.get("rsi"),
+            "above_50dma": live.get("above_50dma"),
+        })
+
+    return result
+
+
+@app.get("/api/it-bear/universe/{symbol}")
+async def it_bear_stock_detail(symbol: str):
+    """Single stock: full details + last 4 quarters + indicators."""
+    from data.it_universe import get_by_symbol
+    from data.earnings_calendar import get_next_earnings, get_quarterly_history
+    from analysis.it_sector_health import _fetch_stock_indicators
+
+    symbol = symbol.upper().strip()
+    stock = get_by_symbol(symbol)
+    if not stock:
+        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not in IT universe")
+
+    yf_sym = stock.get("yf", symbol)
+
+    # Fetch indicators, earnings info concurrently
+    indicators_task = asyncio.to_thread(
+        _fetch_stock_indicators, yf_sym, symbol,
+        stock.get("name", symbol), stock.get("country", "")
+    )
+    earnings_task = get_next_earnings(symbol)
+    history_task = get_quarterly_history(symbol, num_quarters=4)
+
+    indicators, earnings, quarterly = await asyncio.gather(
+        indicators_task, earnings_task, history_task, return_exceptions=True
+    )
+
+    return {
+        **stock,
+        "indicators": indicators if not isinstance(indicators, Exception) else {},
+        "next_earnings": earnings if not isinstance(earnings, Exception) else None,
+        "quarterly_history": quarterly if not isinstance(quarterly, Exception) else [],
+    }
+
+
+@app.get("/api/it-bear/earnings")
+async def it_bear_earnings(days_ahead: int = Query(90, ge=1, le=365)):
+    """Upcoming earnings calendar for IT universe (cached in DB, refreshed daily)."""
+    from data.earnings_calendar import get_universe_earnings_calendar
+    return await get_universe_earnings_calendar(days_ahead=days_ahead)
+
+
+@app.get("/api/it-bear/earnings/refresh-status")
+async def it_bear_earnings_refresh_status():
+    """Tells the frontend whether today's earnings have been refreshed."""
+    from data.earnings_calendar import get_last_refresh_date, is_cache_fresh_today
+    last = await get_last_refresh_date()
+    fresh = await is_cache_fresh_today()
+    return {
+        "last_refresh_date": last,
+        "is_fresh_today": fresh,
+        "today": __import__("datetime").date.today().isoformat(),
+    }
+
+
+@app.post("/api/it-bear/earnings/refresh")
+async def it_bear_earnings_refresh(force: bool = Query(False)):
+    """
+    Refresh earnings + last 4 quarters for the entire IT universe.
+
+    Called by:
+    - The morning-startup script (~/Documents/My Software/start-stock-portfolio.command)
+    - Manual "Refresh" button in the UI
+
+    If already refreshed today, returns the cached summary unless force=true.
+    Refresh takes ~20-30s (21 stocks × 2 yfinance calls, 8-way concurrency).
+    """
+    from data.earnings_calendar import (
+        is_cache_fresh_today, refresh_universe_earnings_cache,
+        get_last_refresh_date,
+    )
+
+    if not force and await is_cache_fresh_today():
+        return {
+            "status": "skipped",
+            "reason": "Already refreshed today",
+            "last_refresh_date": await get_last_refresh_date(),
+        }
+
+    summary = await refresh_universe_earnings_cache()
+    return {"status": "refreshed", **summary}
+
+
+@app.get("/api/it-bear/sector-health")
+async def it_bear_sector_health():
+    """NIFTY IT vs NIFTY 50, macro indicators, and sector heatmap."""
+    from analysis.it_sector_health import (
+        get_nifty_it_vs_nifty50, get_macro_indicators,
+        get_sector_heatmap, get_sector_health_summary,
+    )
+
+    summary, rs_data, macro, heatmap = await asyncio.gather(
+        get_sector_health_summary(),
+        get_nifty_it_vs_nifty50(),
+        get_macro_indicators(),
+        get_sector_heatmap(),
+        return_exceptions=True,
+    )
+
+    return {
+        "summary": summary if not isinstance(summary, Exception) else {},
+        "nifty_it_vs_nifty50": rs_data if not isinstance(rs_data, Exception) else {},
+        "macro": macro if not isinstance(macro, Exception) else {},
+        "heatmap": heatmap if not isinstance(heatmap, Exception) else [],
+    }
+
+
+@app.get("/api/it-bear/scanner")
+async def it_bear_scanner():
+    """
+    Run all 5 IT-bear evaluators against all IT stocks.
+    Returns ranked signals sorted by confidence descending.
+    """
+    from data.it_universe import get_india
+    from data.synthetic_options import generate_synthetic_chain
+    from trading.strategies_it_bear import ALL_IT_BEAR_EVALUATORS
+
+    stocks = get_india()
+    # Reuse the NIFTY IT chain as base for all stocks
+    try:
+        niftyit_chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+    except Exception:
+        niftyit_chain = {"strikes": [], "spot_price": 0, "pcr": 0, "strike_count": 0}
+
+    signals = []
+
+    async def _scan_stock(stock: dict):
+        sym = stock["symbol"]
+        yf_sym = stock.get("yf", sym)
+
+        # Try stock-specific chain, fallback to NIFTY IT chain
+        try:
+            from data.synthetic_options import get_chain_with_fallback
+            chain = await asyncio.to_thread(get_chain_with_fallback, sym, True)
+            if chain.get("strike_count", 0) == 0:
+                chain = niftyit_chain
+        except Exception:
+            chain = niftyit_chain
+
+        spot = chain.get("spot_price", 0)
+        snapshot = {
+            "symbol": sym,
+            "spot": spot,
+            "vix": chain.get("vix", 0),
+            "vix_regime": "unknown",
+            "pcr": chain.get("pcr", 0),
+            "atm": {},
+            "expected_move": 0,
+            "max_pain": 0,
+            "oi_levels": {"support": 0, "resistance": 0},
+            "iv_percentile": -1,
+            "nearest_expiry": "",
+            "days_to_expiry": 28,
+            "greeks": {},
+        }
+
+        stock_signals = []
+        for evaluator in ALL_IT_BEAR_EVALUATORS:
+            try:
+                proposal = await evaluator.evaluate(snapshot, chain)
+                if proposal:
+                    proposal["stock_meta"] = {
+                        "name": stock.get("name", sym),
+                        "tier": stock.get("tier", ""),
+                        "segment": stock.get("segment", ""),
+                    }
+                    stock_signals.append(proposal)
+            except Exception as e:
+                print(f"[scanner] {evaluator.strategy_id} on {sym}: {e}")
+
+        return stock_signals
+
+    tasks = [_scan_stock(s) for s in stocks]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in all_results:
+        if isinstance(result, list):
+            signals.extend(result)
+
+    # Sort by confidence descending
+    signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+
+    return {
+        "signals": signals,
+        "total": len(signals),
+        "scanned_symbols": len(stocks),
+        "evaluators_run": len(ALL_IT_BEAR_EVALUATORS),
+    }
+
+
+@app.get("/api/it-bear/strategy-suggest/{symbol}")
+async def it_bear_suggest_strategy(
+    symbol: str,
+    conviction: str = Query("moderate"),
+    horizon_days: int = Query(30, ge=5, le=365),
+):
+    """
+    Suggest specific option structure for a name given conviction + horizon.
+    Accepts conviction: weak|low | moderate | strong|high
+    horizon_days: 5-365
+    Returns a flat suggestion (matching frontend expectations) PLUS alternatives list.
+    """
+    from data.it_universe import get_by_symbol
+    from data.synthetic_options import generate_synthetic_chain, get_chain_with_fallback
+    from trading.intelligence import get_market_snapshot
+    from trading.strategies_it_bear import (
+        LongPutBreakdownEvaluator, BearPutSpreadEvaluator,
+        BearCallSpreadEvaluator, PreEarningsLongPutEvaluator,
+        NiftyITFuturesShortEvaluator,
+    )
+
+    # Normalize conviction (accept both frontend "weak/moderate/strong" and "low/moderate/high")
+    conv_map = {"weak": "low", "strong": "high", "low": "low", "moderate": "moderate", "high": "high"}
+    conviction_norm = conv_map.get(conviction.lower(), "moderate")
+
+    symbol = symbol.upper().strip()
+    stock = get_by_symbol(symbol)
+
+    if not stock and symbol not in ("NIFTYIT", "NIFTY IT"):
+        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not in IT universe")
+
+    # Get chain (real, fall back to synthetic NIFTY IT if needed)
+    chain_symbol = symbol if symbol != "NIFTY IT" else "NIFTYIT"
+    try:
+        chain = await asyncio.to_thread(get_chain_with_fallback, chain_symbol, True)
+        if chain.get("strike_count", 0) == 0:
+            chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+    except Exception:
+        chain = await asyncio.to_thread(generate_synthetic_chain, "NIFTYIT")
+
+    # Build a REAL snapshot (with ATM data, expected move, OI levels) so evaluators work
+    try:
+        snapshot = await get_market_snapshot(chain_symbol, chain)
+    except Exception as e:
+        print(f"[suggest] snapshot error: {e}")
+        snapshot = {
+            "symbol": chain_symbol,
+            "spot": chain.get("spot_price", 0),
+            "vix": chain.get("vix", 0),
+            "vix_regime": "unknown",
+            "pcr": chain.get("pcr", 0),
+            "atm": {"strike": 0, "CE": {"ltp": 0, "iv": 0}, "PE": {"ltp": 0, "iv": 0}},
+            "expected_move": 0,
+            "max_pain": 0,
+            "oi_levels": {"support": 0, "resistance": 0, "support_oi": 0, "resistance_oi": 0},
+            "iv_percentile": -1,
+            "nearest_expiry": chain.get("expiry_dates", [""])[0] if chain.get("expiry_dates") else "",
+            "days_to_expiry": horizon_days,
+            "greeks": {},
+        }
+
+    # Build indicators for directional strategies (use index_indicators for indices, screener for stocks)
+    indicators = {}
+    try:
+        if chain_symbol in ("NIFTY", "NIFTYIT", "BANKNIFTY"):
+            from trading.index_indicators import get_index_indicators
+            ind_sym = "NIFTYIT" if chain_symbol == "NIFTYIT" else chain_symbol
+            indicators = await asyncio.to_thread(get_index_indicators, ind_sym)
+        else:
+            from analysis.screener import screen_stock
+            screen_result = await asyncio.to_thread(screen_stock, symbol)
+            indicators = screen_result.indicators or {}
+            indicators["overall_score"] = screen_result.overall_score
+    except Exception as e:
+        print(f"[suggest] indicators error: {e}")
+
+    # Strategy recommendation: conviction (normalized) + horizon → preferred evaluator
+    horizon_bucket = "short" if horizon_days <= 14 else "medium" if horizon_days <= 60 else "long"
+
+    strategy_map = {
+        ("high", "short"): NiftyITFuturesShortEvaluator() if chain_symbol == "NIFTYIT" else LongPutBreakdownEvaluator(),
+        ("high", "medium"): LongPutBreakdownEvaluator(),
+        ("high", "long"): BearPutSpreadEvaluator(),
+        ("moderate", "short"): BearCallSpreadEvaluator(),
+        ("moderate", "medium"): BearPutSpreadEvaluator(),
+        ("moderate", "long"): PreEarningsLongPutEvaluator(),
+        ("low", "short"): BearCallSpreadEvaluator(),
+        ("low", "medium"): BearCallSpreadEvaluator(),
+        ("low", "long"): BearPutSpreadEvaluator(),
+    }
+    primary_evaluator = strategy_map.get((conviction_norm, horizon_bucket), BearPutSpreadEvaluator())
+
+    # Run all evaluators, collect any that produce a proposal
+    all_evals = [primary_evaluator, LongPutBreakdownEvaluator(), BearPutSpreadEvaluator(),
+                 BearCallSpreadEvaluator(), PreEarningsLongPutEvaluator()]
+
+    seen_ids = set()
+    suggestions = []
+    for ev in all_evals:
+        if ev.strategy_id in seen_ids:
+            continue
+        seen_ids.add(ev.strategy_id)
+        try:
+            proposal = await ev.evaluate(snapshot, chain, indicators)
+            if proposal:
+                proposal["recommended_for"] = {
+                    "conviction": conviction_norm,
+                    "horizon_days": horizon_days,
+                    "is_primary": ev.strategy_id == primary_evaluator.strategy_id,
+                }
+                suggestions.append(proposal)
+        except Exception as e:
+            print(f"[suggest] {ev.strategy_id} on {symbol}: {e}")
+
+    # FALLBACK: if no evaluator produced anything (conditions too strict), force-build
+    # a Bear Put Spread proposal so the user always sees a structure for their query
+    if not suggestions:
+        try:
+            from datetime import datetime as _dt
+            from trading.strategies import _round_strike, _find_strike_data
+            spot = snapshot.get("spot", 0) or chain.get("spot_price", 0)
+            strikes = chain.get("strikes", [])
+            if spot > 0 and strikes:
+                # Use 100-point wide spread, rounded to 50
+                atm = _round_strike(spot, 50)
+                otm = atm - 100
+                buy_put = _find_strike_data(strikes, atm, "PE")
+                sell_put = _find_strike_data(strikes, otm, "PE")
+                buy_ltp = buy_put.get("ltp") or max(spot * 0.02, 5.0)
+                sell_ltp = sell_put.get("ltp") or max(spot * 0.01, 2.5)
+                debit = max(buy_ltp - sell_ltp, 1.0)
+                lot_size = stock.get("lot_size", 100) if stock else 100
+                spread_width = 100
+                max_loss = debit * lot_size
+                max_profit = max((spread_width - debit) * lot_size, lot_size)
+                fallback = {
+                    "strategy_id": "it_bear_put_spread",
+                    "strategy_name": "Bear Put Spread",
+                    "symbol": chain_symbol,
+                    "direction": "bearish",
+                    "legs": [
+                        {"action": "BUY", "type": "PE", "strike": atm, "qty": lot_size,
+                         "ltp": float(buy_ltp), "option_type": "PE"},
+                        {"action": "SELL", "type": "PE", "strike": otm, "qty": lot_size,
+                         "ltp": float(sell_ltp), "option_type": "PE"},
+                    ],
+                    "max_profit": float(round(max_profit, 2)),
+                    "max_loss": float(round(-abs(max_loss), 2)),
+                    "margin_needed": float(round(max_loss, 2)),
+                    "confidence": 0.55,
+                    "reasoning": (
+                        f"Bear Put Spread on {chain_symbol} @ Rs.{spot:.0f}. "
+                        f"BUY {atm} PE @ Rs.{buy_ltp:.1f}, SELL {otm} PE @ Rs.{sell_ltp:.1f}. "
+                        f"Net debit Rs.{debit:.1f}/unit (Rs.{max_loss:,.0f}/lot). "
+                        f"Conviction: {conviction_norm}, horizon: {horizon_days}d. "
+                        f"Defined-risk structure for the IT bear thesis."
+                    ),
+                    "recommended_for": {
+                        "conviction": conviction_norm,
+                        "horizon_days": horizon_days,
+                        "is_primary": True,
+                    },
+                    "intelligence": {"layer": "core", "spread_width": spread_width,
+                                      "is_fallback": True, "nearest_expiry": snapshot.get("nearest_expiry", "")},
+                    "created_at": _dt.now().isoformat(),
+                }
+                suggestions.append(fallback)
+        except Exception as e:
+            print(f"[suggest] fallback failed: {e}")
+
+    # Primary is the first suggestion (or None)
+    primary = suggestions[0] if suggestions else None
+
+    # Build response: flat top-level fields the frontend expects + suggestions list
+    response = {
+        "symbol": symbol,
+        "conviction": conviction_norm,
+        "horizon_days": horizon_days,
+        "primary_strategy": primary_evaluator.strategy_name,
+        "suggestions": suggestions,
+    }
+    if primary:
+        # Compute breakeven for bear put spread: BUY strike - debit
+        breakeven = None
+        try:
+            legs = primary.get("legs", [])
+            buy_leg = next((l for l in legs if str(l.get("action", "")).upper() == "BUY"), None)
+            if buy_leg:
+                buy_strike = buy_leg.get("strike", 0)
+                buy_ltp = buy_leg.get("ltp", 0)
+                breakeven = buy_strike - buy_ltp
+        except Exception:
+            pass
+
+        response.update({
+            "structure": primary.get("strategy_name", "Bear Put Spread"),
+            "strategy_type": primary.get("strategy_id", ""),
+            "confidence": round(float(primary.get("confidence", 0)) * 100, 0),
+            "legs": primary.get("legs", []),
+            "max_profit": primary.get("max_profit", 0),
+            "max_loss": primary.get("max_loss", 0),
+            "breakeven": breakeven,
+            "capital_required": primary.get("margin_needed", 0),
+            "reasoning": primary.get("reasoning", ""),
+            "layer": primary.get("intelligence", {}).get("layer", "core"),
+        })
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Notification Management API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications/config")
+async def notification_config():
+    """
+    Get notification channel configuration status.
+    Returns which channels are configured (without exposing credentials).
+    """
+    import os
+    return {
+        "email": {
+            "configured": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS")),
+            "recipient": os.getenv("NOTIFY_EMAIL") or os.getenv("SMTP_USER", ""),
+            "smtp_host": os.getenv("SMTP_HOST", ""),
+        },
+        "telegram": {
+            "configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
+            "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+        },
+        "websocket": {
+            "configured": True,  # Always available
+        },
+    }
+
+
+@app.put("/api/notifications/config")
+async def update_notification_config(body: dict):
+    """
+    Update notification channel preferences.
+    Accepts: notify_email, telegram_chat_id, smtp_host, smtp_port, smtp_user.
+    Note: Credentials are NOT stored in DB — use .env file for security.
+    For UI toggle only (enable/disable channels in trading_config).
+    """
+    from db.database import _get_db
+
+    allowed = {"it_bear_enabled", "auto_layer_core", "auto_layer_tactical",
+               "auto_layer_us", "auto_layer_hedge"}
+
+    updates = {k: (1 if v else 0) for k, v in body.items() if k in allowed}
+
+    if not updates:
+        return {"status": "no_changes", "note": "Set SMTP/Telegram credentials in .env file"}
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values())
+
+    async with _get_db() as db:
+        await db.execute(
+            f"UPDATE trading_config SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            values,
+        )
+        await db.commit()
+
+    # Update engine's in-memory layer config
+    from trading.engine import trading_engine
+    for key, val in updates.items():
+        if key.startswith("auto_layer_"):
+            layer = key.replace("auto_layer_", "")
+            trading_engine.auto_execute_layers[layer] = bool(val)
+
+    return {"status": "updated", "fields": list(updates.keys())}
+
+
+@app.post("/api/notifications/test/{channel}")
+async def test_notification(channel: str):
+    """
+    Send a test message to a specific channel.
+    channel: email | telegram | websocket | all
+    """
+    if channel not in ("email", "telegram", "websocket", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid channel '{channel}'. Use: email, telegram, websocket, all"
+        )
+
+    from notifications.dispatcher import send_test_notification
+    results = await send_test_notification(channel)
+    return {
+        "channel": channel,
+        "results": results,
+        "any_success": any(results.values()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Telegram setup + listener control
+# ---------------------------------------------------------------------------
+
+@app.post("/api/notifications/telegram/setup")
+async def telegram_setup(body: dict):
+    """
+    One-step Telegram setup. Body: { "bot_token": "1234:abc..." }
+
+    Persists the token to .env, optionally captures a chat_id from any
+    pending /start messages, then starts the long-polling listener.
+    The user can then send /start to their bot — the listener will
+    auto-save TELEGRAM_CHAT_ID and reply with a welcome message.
+    """
+    from zerodha.auth import _write_env_key
+    from notifications.telegram_listener import start_listener, stop_listener
+    import httpx
+
+    token = (body.get("bot_token") or "").strip()
+    if not token or ":" not in token:
+        raise HTTPException(
+            status_code=400,
+            detail="bot_token is required (looks like '1234567890:AAabcde...')"
+        )
+
+    # Validate by calling getMe
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+            data = resp.json()
+            if not data.get("ok"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid bot token: {data.get('description', 'rejected by Telegram')}"
+                )
+            bot_info = data["result"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to validate token: {e}")
+
+    # Save token
+    _write_env_key("TELEGRAM_BOT_TOKEN", token)
+    os.environ["TELEGRAM_BOT_TOKEN"] = token
+
+    # Try to capture chat_id from existing /start updates (idempotent)
+    chat_id_captured = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            updates_resp = await client.get(f"https://api.telegram.org/bot{token}/getUpdates")
+            updates = updates_resp.json().get("result", [])
+        for upd in updates:
+            msg = upd.get("message", {})
+            if msg.get("text", "").startswith("/start"):
+                cid = msg.get("chat", {}).get("id")
+                if cid:
+                    chat_id_captured = cid
+                    _write_env_key("TELEGRAM_CHAT_ID", str(cid))
+                    os.environ["TELEGRAM_CHAT_ID"] = str(cid)
+                    break
+    except Exception as e:
+        print(f"[telegram_setup] chat_id capture skipped: {e}")
+
+    # Restart listener with new token
+    await stop_listener()
+    listener_result = await start_listener()
+
+    return {
+        "status": "configured",
+        "bot": {
+            "username": bot_info.get("username"),
+            "name": bot_info.get("first_name"),
+        },
+        "chat_id_captured": chat_id_captured,
+        "listener": listener_result,
+        "next_step": (
+            "Send /start to your bot in Telegram. The listener will auto-save your chat_id."
+            if not chat_id_captured
+            else "✅ All set — send /add TCS INFY AAPL to your bot."
+        ),
+    }
+
+
+@app.get("/api/notifications/telegram/status")
+async def telegram_status():
+    """Show whether token + chat_id are set + listener state."""
+    from notifications.telegram_listener import is_listening
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    return {
+        "token_set": bool(token),
+        "token_preview": (token[:10] + "..." + token[-4:]) if token else "",
+        "chat_id_set": bool(chat_id),
+        "chat_id": chat_id,
+        "listener_running": is_listening(),
+    }
+
+
+@app.post("/api/notifications/telegram/listener/{action}")
+async def telegram_listener_control(action: str):
+    """action: start | stop | restart"""
+    from notifications.telegram_listener import start_listener, stop_listener
+    if action == "start":
+        return await start_listener()
+    if action == "stop":
+        return await stop_listener()
+    if action == "restart":
+        await stop_listener()
+        return await start_listener()
+    raise HTTPException(status_code=400, detail="action must be: start | stop | restart")
+
+
+@app.get("/api/telegram/watchlist")
+async def telegram_watchlist():
+    """Return all stocks added to the watchlist via Telegram."""
+    from notifications.telegram_listener import _get_watchlist
+    return await _get_watchlist()
+
+
+# ---------------------------------------------------------------------------
+# LLM Gateway — cost observability + budget control
+# ---------------------------------------------------------------------------
+
+@app.get("/api/llm/usage")
+async def llm_usage():
+    """Token/cost observability: spend today/month, limits, by-feature, recent calls."""
+    from llm.gateway import usage_summary
+    return await usage_summary()
+
+
+@app.get("/api/llm/config")
+async def llm_get_config():
+    """Current LLM limits + provider/model config."""
+    from llm.gateway import get_config
+    return await get_config()
+
+
+@app.put("/api/llm/config")
+async def llm_update_config(body: dict):
+    """Update LLM limits (daily/monthly USD caps, per-call tokens, rate, provider, model)."""
+    from llm.gateway import update_config
+    return await update_config(body)
+
+
+@app.post("/api/llm/test")
+async def llm_test(body: dict = None):
+    """
+    Fire a tiny test completion to verify the provider + key work.
+    Counts against the budget (it's a real call) but capped to ~30 tokens.
+    """
+    from llm.gateway import complete, LLMError
+    body = body or {}
+    try:
+        res = await complete(
+            body.get("prompt", "Reply with exactly: LLM gateway OK"),
+            feature="gateway_test",
+            max_tokens=30,
+            allow_cache=False,
+        )
+        return {"status": "ok", **res.to_dict()}
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail={"status": e.status, "message": str(e)})
+
+
+@app.get("/api/llm/providers")
+async def llm_providers():
+    """Which provider API keys are configured (for the Settings UI)."""
+    return {
+        "anthropic": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
+        "openai": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "groq": bool(os.getenv("GROQ_API_KEY", "").strip()),
+        "gemini": bool(os.getenv("GOOGLE_API_KEY", "").strip()),
+    }
+
+
+@app.post("/api/llm/provider-key")
+async def llm_set_provider_key(body: dict):
+    """
+    Save a provider API key to .env (so the user can paste their Claude/OpenAI key
+    from the UI). body: { provider: 'anthropic'|'openai'|'groq'|'gemini', api_key: '...' }
+    """
+    from zerodha.auth import _write_env_key
+    provider = (body.get("provider") or "").lower()
+    api_key = (body.get("api_key") or "").strip()
+    env_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "gemini": "GOOGLE_API_KEY",
+    }
+    if provider not in env_map:
+        raise HTTPException(status_code=400, detail="provider must be anthropic|openai|groq|gemini")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    _write_env_key(env_map[provider], api_key)
+    os.environ[env_map[provider]] = api_key
+    return {"status": "saved", "provider": provider, "env_var": env_map[provider]}
+
+
+# ---------------------------------------------------------------------------
+# System health (ops/admin) — protected implicitly by auth_middleware since
+# this path starts with /api/.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/system/health")
+async def system_health():
+    """
+    System resource snapshot for the admin dashboard: disk, memory, load
+    average, DB file size, Python version, and server time.
+
+    mem.* fields are None on platforms without /proc/meminfo (e.g. macOS).
+    """
+    import shutil
+    import sys
+    from datetime import datetime, timezone
+
+    # Disk usage (root filesystem)
+    disk_total, _disk_used_ignored, disk_free = shutil.disk_usage("/")
+    disk_used = disk_total - disk_free
+    disk = {
+        "total_gb": round(disk_total / (1024 ** 3), 2),
+        "used_gb": round(disk_used / (1024 ** 3), 2),
+        "pct": round(disk_used / disk_total * 100, 1) if disk_total else None,
+    }
+
+    # Memory — Linux-only via /proc/meminfo; None fields elsewhere (e.g. macOS).
+    mem = {"total_mb": None, "available_mb": None, "pct": None}
+    try:
+        meminfo: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    meminfo[parts[0].strip()] = int(parts[1].strip().split()[0])
+
+        total_kb = meminfo.get("MemTotal")
+        available_kb = meminfo.get("MemAvailable")
+        if total_kb:
+            mem["total_mb"] = round(total_kb / 1024, 1)
+        if available_kb:
+            mem["available_mb"] = round(available_kb / 1024, 1)
+        if total_kb and available_kb:
+            mem["pct"] = round((total_kb - available_kb) / total_kb * 100, 1)
+    except Exception:
+        pass  # /proc/meminfo not available on this platform
+
+    # Load average
+    try:
+        load_avg = list(os.getloadavg())
+    except (OSError, AttributeError):
+        load_avg = None
+
+    # DB file size
+    db_path = Path(__file__).resolve().parent / "data" / "portfolio.db"
+    try:
+        db_size_mb = round(os.path.getsize(db_path) / (1024 ** 2), 2)
+    except OSError:
+        db_size_mb = None
+
+    return {
+        "disk": disk,
+        "mem": mem,
+        "load_avg": load_avg,
+        "db_size_mb": db_size_mb,
+        "python": sys.version.split()[0],
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # WebSocket for trading notifications
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/trading")
 async def trading_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time trading updates."""
+    """WebSocket endpoint for real-time trading updates. Requires a valid session cookie."""
     from trading.engine import trading_engine
+
+    token = websocket.cookies.get("session")
+    user = await get_session_user(token) if token else None
+    if not user:
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
     trading_engine.register_ws(websocket)
 
@@ -1241,3 +2308,45 @@ async def trading_websocket(websocket: WebSocket):
         trading_engine.unregister_ws(websocket)
     except Exception:
         trading_engine.unregister_ws(websocket)
+
+
+# ---------------------------------------------------------------------------
+# SPA static serving — serves the built frontend (frontend/dist), if present.
+#
+# Entirely a no-op in dev before `npm run build` has ever produced a dist/
+# folder: none of the routes below get registered, so nothing about local
+# dev (Vite on :5173 talking to this API on its own port) changes.
+#
+# Must stay at the very end of the file: the catch-all route matches any
+# path, so anything registered after it would be unreachable.
+# ---------------------------------------------------------------------------
+
+_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+if _FRONTEND_DIST.exists():
+    _FRONTEND_ASSETS = _FRONTEND_DIST / "assets"
+    if _FRONTEND_ASSETS.exists():
+        app.mount("/assets", StaticFiles(directory=str(_FRONTEND_ASSETS)), name="assets")
+
+    _FRONTEND_FAVICON = _FRONTEND_DIST / "favicon.svg"
+
+    @app.get("/favicon.svg")
+    async def _spa_favicon():
+        if _FRONTEND_FAVICON.exists():
+            return FileResponse(str(_FRONTEND_FAVICON))
+        raise HTTPException(status_code=404, detail="favicon.svg not found")
+
+    @app.get("/{full_path:path}")
+    async def _spa_catch_all(full_path: str):
+        """Serve index.html for any non-API, non-WS path (client-side routing)."""
+        if full_path.startswith("api/") or full_path == "ws" or full_path.startswith("ws/"):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        index_file = _FRONTEND_DIST / "index.html"
+        if not index_file.exists():
+            raise HTTPException(status_code=404, detail="Frontend build not found")
+        return FileResponse(str(index_file))
+
+    print(f"[main] Serving SPA static build from {_FRONTEND_DIST}")
+else:
+    print(f"[main] Frontend dist not found at {_FRONTEND_DIST} — SPA static serving disabled (dev mode).")

@@ -11,7 +11,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import PnLChart from './PnLChart'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = ''
 
 function fmtINR(n) {
   if (n === undefined || n === null || isNaN(n)) return '—'
