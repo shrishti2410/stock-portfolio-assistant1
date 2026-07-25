@@ -93,8 +93,10 @@ async def authenticate(username: str, password: str) -> dict | None:
 
     async with _get_db() as db:
         db.row_factory = aiosqlite.Row
+        # Case-insensitive username match (phones/browsers auto-capitalize the
+        # first letter) — password stays exact.
         rows = await db.execute_fetchall(
-            "SELECT * FROM users WHERE username = ?", (username.strip(),)
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username.strip(),)
         )
         if not rows:
             return None
